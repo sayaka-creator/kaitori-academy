@@ -29915,6 +29915,442 @@ window.KA.del={ remove:removeItem, removeMany:removeMany, restore:restoreItem, r
 })();
 
 </script>
+<script id="kaImgAudit">
+/* ==========================================================================
+   買取アカデミー — 画像チェック（管理者向け）
+   [1] 画像の「選択・保存・削除」が効かない不具合を修正
+   [2] 汎用問題文（この画像の〜は何でしょう？）での誤共有を防止・一掃
+   [3] 画像を入れたもの一覧（正誤判定つき）＋ その場で変更／該当項目へ移動
+   [4] 正しい画像セットの書き出し（配布用ファイル名＋対応表）
+   既存の機能・内容は変更しません（追加のみ）
+   ========================================================================== */
+(function () {
+  'use strict';
+
+  var GENERIC = /この画像の.{0,12}は何でしょう/;
+  function isGeneric(t) { return GENERIC.test(String(t || '')); }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function D() { return window.KA && window.KA.data; }
+  function IMG() { return window.KA && window.KA.images; }
+  function toast(m, k) { try { window.KA.ui.toast(m, k); } catch (e) { } }
+
+  /* ---------------- 1) 画像ボタンの不具合を修正 ---------------- */
+  function fixedBindImageSlots(root) {
+    var box = root || document;
+    if (!box.querySelectorAll) return;
+    /* 変更・追加：ファイル入力を .img-slot 全体から探す（従来はバー内だけを探して失敗していた） */
+    box.querySelectorAll('[data-islot-pick]').forEach(function (btn) {
+      btn.onclick = function (ev) {
+        ev.preventDefault(); ev.stopPropagation();
+        var slot = btn.closest('.img-slot') || btn.parentNode;
+        var inp = slot ? slot.querySelector('[data-islot-file]') : null;
+        if (!inp) { inp = document.querySelector('[data-islot-file="' + btn.getAttribute('data-islot-pick') + '"]'); }
+        if (inp) inp.click();
+        else toast('画像の入力欄が見つかりませんでした', 'bad');
+      };
+    });
+    box.querySelectorAll('[data-islot-file]').forEach(function (inp) {
+      inp.onclick = function (ev) { ev.stopPropagation(); };
+      inp.onchange = function (ev) {
+        ev.stopPropagation();
+        var key = inp.getAttribute('data-islot-file');
+        var f = inp.files && inp.files[0];
+        inp.value = '';
+        if (!f || !key) return;
+        var im = IMG(); if (!im) { toast('画像を保存できません', 'bad'); return; }
+        toast('画像を保存しています…');
+        im.saveFile(f, key).then(function (rec) {
+          var path = suggestPath(key, im.extOf ? im.extOf(rec.type) : 'png');
+          applyPath(key, path);
+          try { D().refresh(); } catch (e) { }
+          toast('画像を反映しました（' + Math.round((rec.size || 0) / 1024) + ' KB）', 'good');
+          try { window.KA.rerender(); } catch (e) { }
+        }).catch(function (e) {
+          toast('アップロードできませんでした: ' + (e && e.message ? e.message : e), 'bad');
+        });
+      };
+    });
+    /* 削除 */
+    box.querySelectorAll('[data-islot-del]').forEach(function (btn) {
+      btn.onclick = function (ev) {
+        ev.preventDefault(); ev.stopPropagation();
+        var key = btn.getAttribute('data-islot-del');
+        if (!window.confirm('この画像を削除しますか？')) return;
+        var im = IMG(); if (!im) return;
+        im.del(key).then(function () {
+          applyPath(key, '');
+          try { D().refresh(); } catch (e) { }
+          toast('画像を削除しました', 'good');
+          try { window.KA.rerender(); } catch (e) { }
+        });
+      };
+    });
+  }
+  function patchBind() {
+    var u = window.KA && window.KA.ui;
+    if (!u || u.__kaFixedBind) return false;
+    u.bindImageSlots = fixedBindImageSlots;
+    u.__kaFixedBind = true;
+    return true;
+  }
+
+  /* 保存先のファイル名（自分のIDに由来。他人の名前は使いません） */
+  function suggestPath(key, ext) {
+    ext = ext || 'png';
+    if (key.indexOf('f:') === 0) return 'assets/images/uploads/' + key.slice(2) + '.' + ext;
+    if (key.indexOf('q:') === 0) {
+      var q = null; try { q = D().question(key.slice(2)); } catch (e) { }
+      var g = (q && q.group) ? q.group : 'misc';
+      return (window.KA_CONFIG.quizImageDir || 'assets/images/quiz/') + g + '/' + key.slice(2) + '.' + ext;
+    }
+    if (key.indexOf('l:') === 0) {
+      var p = key.split(':');
+      return 'assets/images/uploads/' + p[1] + '-' + (p[2] || 'main') + '.' + ext;
+    }
+    return '';
+  }
+  function applyPath(key, path) {
+    var d = D(); if (!d) return;
+    try {
+      if (key.indexOf('f:') === 0) d.patchFlashcard(key.slice(2), { imagePath: path, image: path });
+      else if (key.indexOf('q:') === 0) d.patchQuestion(key.slice(2), { imagePath: path, image: path }, { noVersion: true });
+      else if (key.indexOf('l:') === 0) {
+        var p = key.split(':');
+        if (p[2] === 'thumb') d.patchLesson(p[1], { thumbnailPath: path });
+        else if (p[2] === 'person') d.patchLesson(p[1], { personImagePath: path });
+        else d.patchLesson(p[1], { mainImagePath: path });
+      }
+    } catch (e) { }
+  }
+
+  /* ---------------- 2) 汎用問題文の誤共有を防止 ---------------- */
+  function guardShare() {
+    var p = window.KA && window.KA.plus;
+    if (!p || p.__kaGuarded) return false;
+    var origMatch = p.matchPair;
+    p.matchPair = function (c, q) {
+      if (isGeneric(c && c.front) || isGeneric(q && q.text)) return false;
+      try { return origMatch ? origMatch(c, q) : false; } catch (e) { return false; }
+    };
+    var origFind = p.findBadShares;
+    p.findBadShares = function () {
+      var out = [];
+      try { out = (origFind ? origFind() : []) || []; } catch (e) { out = []; }
+      return out.filter(function (x) { return !isGeneric(x && x.text); });
+    };
+    p.__kaGuarded = true;
+    return true;
+  }
+  window.KA_IS_GENERIC = isGeneric;
+
+  /* ---------------- 3) 画像を入れたもの一覧 ---------------- */
+  function ownStem(key) {
+    if (key.indexOf('f:') === 0 || key.indexOf('q:') === 0) return key.slice(2);
+    if (key.indexOf('l:') === 0) { var p = key.split(':'); return p[1] + '-' + (p[2] || 'main'); }
+    return key;
+  }
+  function baseStem(path) {
+    var b = String(path || '').split('/').pop() || '';
+    return b.replace(/\.[a-z0-9]+$/i, '');
+  }
+  function has(key) { var im = IMG(); if (!im) return false; try { return im.has(key) ? true : !!im.urlFor(key); } catch (e) { return false; } }
+  function urlOf(key) { var im = IMG(); try { return im.urlFor(key) || ''; } catch (e) { return ''; } }
+
+  function collect() {
+    var d = D(); if (!d) return [];
+    var rows = [];
+    function push(kind, id, key, title, path, needs, editHref) {
+      var p = path || '';
+      var own = (p ? baseStem(p) === ownStem(key) : true);
+      var exists = has(key);
+      var st;
+      if (!exists && !p) st = 'none';                     /* 未設定 */
+      else if (p && !own) st = 'wrong';                   /* 他人の名前 ＝ 誤共有の疑い */
+      else if (exists) st = 'ok';
+      else st = 'missing';                                /* パスはあるが実体がない */
+      rows.push({ kind: kind, id: id, key: key, title: title, path: p, needs: !!needs, state: st, href: editHref, url: urlOf(key) });
+    }
+    var cards = []; try { cards = d.flashcards ? d.flashcards() : []; } catch (e) { }
+    cards.forEach(function (c) {
+      var isDel = false; try { isDel = window.KA.plus.isRemoved ? window.KA.plus.isRemoved(c.id) : false; } catch (e) { }
+      if (isDel) return;
+      push('card', c.id, 'f:' + c.id, c.front || c.id, c.imagePath || c.image || '', c.needsImage !== false, '#/admin/card/' + c.id);
+    });
+    var qs = []; try { qs = d.questions ? d.questions() : []; } catch (e) { }
+    qs.forEach(function (q) {
+      push('question', q.id, 'q:' + q.id, q.text || q.id, q.imagePath || q.image || '', q.needsImage, '#/admin/question/' + q.id);
+    });
+    var ls = []; try { ls = d.lessons ? d.lessons() : []; } catch (e) { }
+    ls.forEach(function (l) {
+      if (l.mainImagePath || l.mainImage) push('lesson', l.id, 'l:' + l.id + ':main', l.title || l.id, l.mainImagePath || l.mainImage, true, '#/admin/lesson/' + l.id);
+      if (l.personImagePath || l.personImage) push('lesson', l.id, 'l:' + l.id + ':person', (l.title || l.id) + '（人物）', l.personImagePath || l.personImage, true, '#/admin/lesson/' + l.id);
+    });
+    /* 重複（同じ画像を複数が使っている）を検出 */
+    var by = {};
+    rows.forEach(function (r) { if (r.path) { (by[r.path] = by[r.path] || []).push(r); } });
+    rows.forEach(function (r) { r.dupes = (r.path && by[r.path]) ? by[r.path].length : 0; });
+    return rows;
+  }
+
+  /* 誤共有の一掃：自分の名前でない画像パスを外す（持ち主の画像は残す） */
+  function clearWrongShares() {
+    var rows = collect().filter(function (r) { return r.state === 'wrong'; });
+    if (!rows.length) { toast('誤共有は見つかりませんでした', 'good'); return; }
+    var ok = window.confirm(rows.length + ' 件の画像が「他の項目の名前」になっています。\n自分の名前でない画像を外します（持ち主の画像は残ります）。よろしいですか？');
+    if (!ok) return;
+    rows.forEach(function (r) {
+      var im = IMG(); if (im) { try { im.del(r.key); } catch (e) { } }
+      applyPath(r.key, '');
+    });
+    try { D().refresh(); } catch (e) { }
+    toast(rows.length + ' 件の誤共有を外しました。画像を入れ直してください。', 'good');
+    render(); try { window.KA.rerender(); } catch (e) { }
+  }
+
+  /* ---------------- 4) 書き出し ---------------- */
+  var CT = (function () { var t = [], c, n, k; for (n = 0; n < 256; n++) { c = n; for (k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; } return t; })();
+  function crc32(u8) { var c = 0xFFFFFFFF; for (var i = 0; i < u8.length; i++) c = CT[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+  function makeZip(files) {
+    var enc = new TextEncoder(), chunks = [], central = [], offset = 0;
+    files.forEach(function (f) {
+      var nb = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+      var lh = new Uint8Array(30 + nb.length), dv = new DataView(lh.buffer);
+      dv.setUint32(0, 0x04034b50, true); dv.setUint16(4, 20, true); dv.setUint16(6, 0, true);
+      dv.setUint16(8, 0, true); dv.setUint16(10, 0, true); dv.setUint16(12, 0, true);
+      dv.setUint32(14, crc, true); dv.setUint32(18, size, true); dv.setUint32(22, size, true);
+      dv.setUint16(26, nb.length, true); dv.setUint16(28, 0, true); lh.set(nb, 30);
+      chunks.push(lh, f.data);
+      var ch = new Uint8Array(46 + nb.length), d2 = new DataView(ch.buffer);
+      d2.setUint32(0, 0x02014b50, true); d2.setUint16(4, 20, true); d2.setUint16(6, 20, true);
+      d2.setUint16(8, 0, true); d2.setUint16(10, 0, true); d2.setUint16(12, 0, true); d2.setUint16(14, 0, true);
+      d2.setUint32(16, crc, true); d2.setUint32(20, size, true); d2.setUint32(24, size, true);
+      d2.setUint16(28, nb.length, true); d2.setUint16(30, 0, true); d2.setUint16(32, 0, true);
+      d2.setUint16(34, 0, true); d2.setUint16(36, 0, true); d2.setUint32(38, 0, true); d2.setUint32(42, offset, true);
+      ch.set(nb, 46); central.push(ch); offset += lh.length + size;
+    });
+    var cs = central.reduce(function (a, b) { return a + b.length; }, 0);
+    var eo = new Uint8Array(22), d3 = new DataView(eo.buffer);
+    d3.setUint32(0, 0x06054b50, true); d3.setUint16(8, files.length, true); d3.setUint16(10, files.length, true);
+    d3.setUint32(12, cs, true); d3.setUint32(16, offset, true);
+    return new Blob(chunks.concat(central, [eo]), { type: 'application/zip' });
+  }
+  function dl(name, blob) {
+    var u = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = u; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(u); }, 5000);
+  }
+  function outName(key, ext) { return key.replace(/:/g, '-') + '.' + (ext || 'png'); }
+
+  function exportAll() {
+    var im = IMG(); if (!im) { toast('画像ストアを利用できません', 'bad'); return; }
+    var rows = collect();
+    var withImg = rows.filter(function (r) { return r.url; });
+    if (!withImg.length) { toast('書き出せる画像がありません', 'bad'); return; }
+    var files = [], map = {}, paths = {};
+    Promise.all(withImg.map(function (r) {
+      return fetch(r.url).then(function (res) { return res.blob(); }).then(function (b) {
+        var type = b.type || 'image/png';
+        var ext = type.indexOf('jpeg') >= 0 ? 'jpg' : (type.indexOf('webp') >= 0 ? 'webp' : 'png');
+        var nm = outName(r.key, ext);
+        map[r.key] = nm;
+        paths[r.key] = { kind: r.kind, id: r.id, path: 'assets/images/uploads/' + nm };
+        return b.arrayBuffer().then(function (buf) { files.push({ name: nm, data: new Uint8Array(buf) }); });
+      }).catch(function () { });
+    })).then(function () {
+      var manifest = {
+        app: '買取アカデミー', kind: 'image-package', exportedAt: new Date().toISOString(),
+        note: 'このZIPを解凍し、中の画像を GitHub の assets /images/ に入れてください。対応表（このJSON）どおりに imagePath を更新すると確実です。',
+        count: files.length, map: map, paths: paths
+      };
+      files.push({ name: '画像の対応表.json', data: new TextEncoder().encode(JSON.stringify(manifest, null, 2)) });
+      files.push({ name: 'README.txt', data: new TextEncoder().encode(
+        '買取アカデミー 画像パッケージ\n\n' +
+        '1) このZIPを解凍します。\n' +
+        '2) 中の画像（' + map_len(map) + '枚）を GitHub の assets /images/ に入れます。\n' +
+        '3) commit → push すると、サイトに反映されます。\n\n' +
+        'ファイル名は変えないでください。\n'
+      ) });
+      dl('kaitori-images-' + files.length + '.zip', makeZip(files));
+      toast(files.length + ' 件を書き出しました', 'good');
+    });
+  }
+  function map_len(m) { var n = 0; for (var k in m) n++; return n; }
+
+  /* ---------------- 画面 ---------------- */
+  var filter = 'all';
+  function adminMode() { try { return window.KA.store.mode() === 'admin'; } catch (e) { return false; } }
+
+  function render() {
+    var host = document.getElementById('kaImgAudit'); if (!host) return;
+    var rows = collect();
+    var nOk = rows.filter(function (r) { return r.state === 'ok'; }).length;
+    var nNo = rows.filter(function (r) { return r.state === 'none'; }).length;
+    var nBad = rows.filter(function (r) { return r.state === 'wrong'; }).length;
+    var nMis = rows.filter(function (r) { return r.state === 'missing'; }).length;
+    var view = rows;
+    if (filter === 'wrong') view = rows.filter(function (r) { return r.state === 'wrong'; });
+    else if (filter === 'none') view = rows.filter(function (r) { return r.state === 'none'; });
+    else if (filter === 'ok') view = rows.filter(function (r) { return r.state === 'ok'; });
+
+    var badge = {
+      ok: '<span class="kia-b ok">正しい</span>',
+      wrong: '<span class="kia-b wrong">名前が違う</span>',
+      none: '<span class="kia-b none">画像なし</span>',
+      missing: '<span class="kia-b missing">実体なし</span>'
+    };
+    var body = view.slice(0, 400).map(function (r) {
+      var thumb = r.url
+        ? '<img src="' + esc(r.url) + '" alt="">'
+        : '<span class="kia-ph">＋</span>';
+      return '<div class="kia-row" data-key="' + esc(r.key) + '">'
+        + '<div class="kia-th">' + thumb + '</div>'
+        + '<div class="kia-mid">'
+        + '<div class="kia-ttl">' + esc(String(r.title).slice(0, 46)) + '</div>'
+        + '<div class="kia-sub">' + esc(r.key) + (r.dupes > 1 ? '　同じ画像を ' + r.dupes + ' 件が使用' : '') + '</div>'
+        + '</div>'
+        + '<div class="kia-act">' + (badge[r.state] || '')
+        + '<a class="kia-btn" href="' + esc(r.href) + '" data-open="1">開く</a>'
+        + '<button class="kia-btn" data-pick="' + esc(r.key) + '">変更</button>'
+        + (r.url ? '<button class="kia-btn del" data-del="' + esc(r.key) + '">削除</button>' : '')
+        + '<input type="file" accept="image/*" hidden data-file="' + esc(r.key) + '">'
+        + '</div></div>';
+    }).join('');
+
+    host.innerHTML =
+      '<div class="kia-panel">'
+      + '<div class="kia-head">'
+      + '<h3>画像チェック</h3>'
+      + '<div class="kia-sum">正しい <b>' + nOk + '</b> ／ 画像なし <b>' + nNo + '</b> ／ 名前が違う <b class="r">' + nBad + '</b> ／ 実体なし <b>' + nMis + '</b></div>'
+      + '<div class="kia-tabs">'
+      + '<button data-f="all" class="' + (filter === 'all' ? 'on' : '') + '">すべて ' + rows.length + '</button>'
+      + '<button data-f="wrong" class="' + (filter === 'wrong' ? 'on' : '') + '">名前が違う ' + nBad + '</button>'
+      + '<button data-f="none" class="' + (filter === 'none' ? 'on' : '') + '">画像なし ' + nNo + '</button>'
+      + '<button data-f="ok" class="' + (filter === 'ok' ? 'on' : '') + '">正しい ' + nOk + '</button>'
+      + '</div>'
+      + '<div class="kia-tools">'
+      + '<button class="kia-main" data-tool="clear">誤共有を外す（' + nBad + '）</button>'
+      + '<button class="kia-main" data-tool="export">画像を書き出す</button>'
+      + '<button class="kia-close" data-tool="close">閉じる</button>'
+      + '</div></div>'
+      + '<div class="kia-list">' + (body || '<p class="kia-empty">該当する項目はありません。</p>') + '</div>'
+      + '<div class="kia-note">「名前が違う」＝他の項目の画像名になっている状態です。「誤共有を外す」を押すと、持ち主の画像だけを残して外します。その後、1件ずつ「変更」で入れ直してください。「開く」で内容を確認できます。</div>'
+      + '</div>';
+
+    host.querySelectorAll('[data-f]').forEach(function (b) {
+      b.onclick = function () { filter = b.getAttribute('data-f'); render(); };
+    });
+    host.querySelectorAll('[data-tool]').forEach(function (b) {
+      b.onclick = function () {
+        var t = b.getAttribute('data-tool');
+        if (t === 'clear') clearWrongShares();
+        else if (t === 'export') exportAll();
+        else host.style.display = 'none';
+      };
+    });
+    host.querySelectorAll('[data-pick]').forEach(function (b) {
+      b.onclick = function () {
+        var inp = host.querySelector('[data-file="' + b.getAttribute('data-pick') + '"]');
+        if (inp) inp.click();
+      };
+    });
+    host.querySelectorAll('[data-file]').forEach(function (inp) {
+      inp.onchange = function () {
+        var key = inp.getAttribute('data-file');
+        var f = inp.files && inp.files[0]; inp.value = '';
+        if (!f || !key) return;
+        var im = IMG(); if (!im) return;
+        toast('保存しています…');
+        im.saveFile(f, key).then(function (rec) {
+          applyPath(key, suggestPath(key, im.extOf ? im.extOf(rec.type) : 'png'));
+          try { D().refresh(); } catch (e) { }
+          toast('画像を反映しました', 'good');
+          render(); try { window.KA.rerender(); } catch (e) { }
+        }).catch(function (e) { toast('失敗: ' + (e && e.message ? e.message : e), 'bad'); });
+      };
+    });
+    host.querySelectorAll('[data-del]').forEach(function (b) {
+      b.onclick = function () {
+        var key = b.getAttribute('data-del');
+        if (!window.confirm('この画像を削除しますか？')) return;
+        var im = IMG(); if (!im) return;
+        im.del(key).then(function () { applyPath(key, ''); try { D().refresh(); } catch (e) { } render(); });
+      };
+    });
+    host.querySelectorAll('[data-open]').forEach(function (a) {
+      a.onclick = function () { setTimeout(function () { try { host.style.display = 'none'; } catch (e) { } }, 60); };
+    });
+  }
+
+  function mount() {
+    if (!adminMode()) { var h = document.getElementById('kaImgAudit'); if (h) h.style.display = 'none'; var f = document.getElementById('kaImgFab'); if (f) f.style.display = 'none'; return; }
+    if (document.getElementById('kaImgFab')) { var f2 = document.getElementById('kaImgFab'); f2.style.display = 'block'; return; }
+    var st = document.createElement('style');
+    st.textContent = ''
+      + '#kaImgFab{position:fixed;right:14px;bottom:calc(150px + env(safe-area-inset-bottom,0px));z-index:9000;'
+      + 'background:#2f6238;color:#fff;border:0;border-radius:999px;padding:11px 16px;font-size:13px;font-weight:800;'
+      + 'box-shadow:0 8px 22px rgba(0,0,0,.28);cursor:pointer;font-family:inherit}'
+      + '#kaImgAudit{position:fixed;inset:0;z-index:9500;background:rgba(240,244,235,.98);overflow:auto;display:none}'
+      + '#kaImgAudit .kia-panel{max-width:900px;margin:0 auto;padding:16px 14px 60px}'
+      + '#kaImgAudit .kia-head{position:sticky;top:0;background:rgba(240,244,235,.98);padding-bottom:8px;border-bottom:1px solid #dde5cb;z-index:2}'
+      + '#kaImgAudit h3{margin:0 0 6px;font-size:18px;color:#26361d}'
+      + '#kaImgAudit .kia-sum{font-size:13px;color:#5c6b4e;margin-bottom:8px}'
+      + '#kaImgAudit .kia-sum b{color:#2f6238}'
+      + '#kaImgAudit .kia-sum b.r{color:#c2593c}'
+      + '#kaImgAudit .kia-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}'
+      + '#kaImgAudit .kia-tabs button{border:1px solid #dde5cb;background:#fff;color:#4a5a3f;border-radius:999px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}'
+      + '#kaImgAudit .kia-tabs button.on{background:#2f6238;color:#fff;border-color:#2f6238}'
+      + '#kaImgAudit .kia-tools{display:flex;gap:8px;flex-wrap:wrap}'
+      + '#kaImgAudit .kia-main{background:#d8b862;color:#1d2a18;border:0;border-radius:999px;padding:10px 16px;font-size:13px;font-weight:800;cursor:pointer;font-family:inherit}'
+      + '#kaImgAudit .kia-close{background:#fff;color:#4a5a3f;border:1px solid #dde5cb;border-radius:999px;padding:10px 16px;font-size:13px;font-weight:700;cursor:pointer;margin-left:auto;font-family:inherit}'
+      + '#kaImgAudit .kia-list{margin-top:12px}'
+      + '#kaImgAudit .kia-row{display:flex;gap:10px;align-items:center;background:#fff;border:1px solid #dde5cb;border-radius:12px;padding:8px;margin-bottom:8px}'
+      + '#kaImgAudit .kia-th{flex:0 0 54px;width:54px;height:42px;border-radius:8px;overflow:hidden;background:#f4f7ee;display:flex;align-items:center;justify-content:center}'
+      + '#kaImgAudit .kia-th img{width:100%;height:100%;object-fit:contain}'
+      + '#kaImgAudit .kia-ph{color:#a8b59a;font-size:18px;font-weight:800}'
+      + '#kaImgAudit .kia-mid{flex:1 1 auto;min-width:0}'
+      + '#kaImgAudit .kia-ttl{font-size:13px;font-weight:700;color:#26361d;line-height:1.45}'
+      + '#kaImgAudit .kia-sub{font-size:10.5px;color:#8b9880;word-break:break-all}'
+      + '#kaImgAudit .kia-act{flex:0 0 auto;display:flex;align-items:center;gap:5px;flex-wrap:wrap;justify-content:flex-end;max-width:230px}'
+      + '#kaImgAudit .kia-b{font-size:10px;font-weight:800;border-radius:999px;padding:3px 8px}'
+      + '#kaImgAudit .kia-b.ok{background:#e7f0dc;color:#2f6238}'
+      + '#kaImgAudit .kia-b.wrong{background:#f7e6e1;color:#a2452c}'
+      + '#kaImgAudit .kia-b.none{background:#f2f3ef;color:#8b9880}'
+      + '#kaImgAudit .kia-b.missing{background:#fdf3dd;color:#8a6410}'
+      + '#kaImgAudit .kia-btn{font-size:11px;font-weight:700;border:1px solid #dde5cb;background:#fff;color:#3d4a33;border-radius:999px;padding:5px 10px;cursor:pointer;text-decoration:none;font-family:inherit}'
+      + '#kaImgAudit .kia-btn.del{color:#a2452c;border-color:#eed3c9}'
+      + '#kaImgAudit .kia-note{margin-top:12px;font-size:11.5px;color:#6f7c62;line-height:1.8;background:#f6f9f0;border-left:3px solid #d8b862;border-radius:0 8px 8px 0;padding:10px 12px}'
+      + '#kaImgAudit .kia-empty{text-align:center;color:#8b9880;padding:30px 0}';
+    document.head.appendChild(st);
+
+    var fab = document.createElement('button');
+    fab.id = 'kaImgFab'; fab.type = 'button'; fab.textContent = '画像チェック';
+    fab.onclick = function () {
+      var h = document.getElementById('kaImgAudit');
+      h.style.display = 'block'; filter = 'all'; render();
+    };
+    document.body.appendChild(fab);
+
+    var host = document.createElement('div');
+    host.id = 'kaImgAudit';
+    document.body.appendChild(host);
+  }
+
+  try { patchBind(); guardShare(); } catch (e) { }
+  var n = 0, t = setInterval(function () {
+    n++;
+    try { patchBind(); guardShare(); } catch (e) { }
+    if (n > 200) clearInterval(t);
+  }, 100);
+  setInterval(function () { try { mount(); } catch (e) { } }, 1200);
+
+  window.KA.imgAudit = { collect: collect, render: render, isGeneric: isGeneric, clearWrongShares: clearWrongShares, exportAll: exportAll };
+})();
+
+</script>
 <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4bc70e2c01a94c73b74392e4234840661791215815920" integrity="sha512-L0ha0OXavK/8okipN9F8BtP84dg9DUhPERbBXzwI6dgTA55d2+yweo3pn5CSFYs45/r8md2+xvUPtTdvTNRfjA==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","spa":2}' crossorigin="anonymous"></script>
 </body>
 </html>
