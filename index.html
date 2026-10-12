@@ -29917,17 +29917,19 @@ window.KA.del={ remove:removeItem, removeMany:removeMany, restore:restoreItem, r
 </script>
 <script id="kaImgAudit">
 /* ==========================================================================
-   買取アカデミー — 画像チェック（管理者向け）
-   [1] 画像の「選択・保存・削除」が効かない不具合を修正
-   [2] 汎用問題文（この画像の〜は何でしょう？）での誤共有を防止・一掃
-   [3] 画像を入れたもの一覧（正誤判定つき）＋ その場で変更／該当項目へ移動
-   [4] 正しい画像セットの書き出し（配布用ファイル名＋対応表）
-   既存の機能・内容は変更しません（追加のみ）
+   買取アカデミー — 画像チェック（管理者向け・見て分かる版）
+   ・アップロード画像と、それが使われている教材／クイズ／暗記カードを縦に並べる
+   ・画像を大きく表示し、内容と合っているかを目で確認できる
+   ・合っていれば そのまま／違えば「変更」で入れ直す／「削除」
+   ・カード画像を変えると、同じ内容のクイズにも自動で反映
+   ・書き出しは「日時つきZIP ＋ 1つのフォルダ」で重複しない
+   ※ 既存の機能・内容は変更しません（追加のみ）
    ========================================================================== */
 (function () {
   'use strict';
+  window.KA = window.KA || {};
 
-  var GENERIC = /この画像の.{0,12}は何でしょう/;
+  var GENERIC = /この画像の/;
   function isGeneric(t) { return GENERIC.test(String(t || '')); }
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -29938,67 +29940,26 @@ window.KA.del={ remove:removeItem, removeMany:removeMany, restore:restoreItem, r
   function IMG() { return window.KA && window.KA.images; }
   function toast(m, k) { try { window.KA.ui.toast(m, k); } catch (e) { } }
 
-  /* ---------------- 1) 画像ボタンの不具合を修正 ---------------- */
-  function fixedBindImageSlots(root) {
-    var box = root || document;
-    if (!box.querySelectorAll) return;
-    /* 変更・追加：ファイル入力を .img-slot 全体から探す（従来はバー内だけを探して失敗していた） */
-    box.querySelectorAll('[data-islot-pick]').forEach(function (btn) {
-      btn.onclick = function (ev) {
-        ev.preventDefault(); ev.stopPropagation();
-        var slot = btn.closest('.img-slot') || btn.parentNode;
-        var inp = slot ? slot.querySelector('[data-islot-file]') : null;
-        if (!inp) { inp = document.querySelector('[data-islot-file="' + btn.getAttribute('data-islot-pick') + '"]'); }
-        if (inp) inp.click();
-        else toast('画像の入力欄が見つかりませんでした', 'bad');
-      };
-    });
-    box.querySelectorAll('[data-islot-file]').forEach(function (inp) {
-      inp.onclick = function (ev) { ev.stopPropagation(); };
-      inp.onchange = function (ev) {
-        ev.stopPropagation();
-        var key = inp.getAttribute('data-islot-file');
-        var f = inp.files && inp.files[0];
-        inp.value = '';
-        if (!f || !key) return;
-        var im = IMG(); if (!im) { toast('画像を保存できません', 'bad'); return; }
-        toast('画像を保存しています…');
-        im.saveFile(f, key).then(function (rec) {
-          var path = suggestPath(key, im.extOf ? im.extOf(rec.type) : 'png');
-          applyPath(key, path);
-          try { D().refresh(); } catch (e) { }
-          toast('画像を反映しました（' + Math.round((rec.size || 0) / 1024) + ' KB）', 'good');
-          try { window.KA.rerender(); } catch (e) { }
-        }).catch(function (e) {
-          toast('アップロードできませんでした: ' + (e && e.message ? e.message : e), 'bad');
-        });
-      };
-    });
-    /* 削除 */
-    box.querySelectorAll('[data-islot-del]').forEach(function (btn) {
-      btn.onclick = function (ev) {
-        ev.preventDefault(); ev.stopPropagation();
-        var key = btn.getAttribute('data-islot-del');
-        if (!window.confirm('この画像を削除しますか？')) return;
-        var im = IMG(); if (!im) return;
-        im.del(key).then(function () {
-          applyPath(key, '');
-          try { D().refresh(); } catch (e) { }
-          toast('画像を削除しました', 'good');
-          try { window.KA.rerender(); } catch (e) { }
-        });
-      };
-    });
-  }
-  function patchBind() {
+  /* ---------------- 管理者モードの判定 ---------------- */
+  function isAdminMode() {
     var u = window.KA && window.KA.ui;
-    if (!u || u.__kaFixedBind) return false;
-    u.bindImageSlots = fixedBindImageSlots;
-    u.__kaFixedBind = true;
-    return true;
+    if (u && typeof u.isAdmin === 'function') { try { if (u.isAdmin()) return true; } catch (e) { } }
+    try {
+      var mk = (window.KA_CONFIG && window.KA_CONFIG.modeKey) || 'kaitori_academy_mode_v1';
+      var m = window.localStorage.getItem(mk);
+      if (m === 'admin') return true;
+      if (m === 'staff') return false;
+      return !!(window.KA_CONFIG && window.KA_CONFIG.defaultMode === 'admin');
+    } catch (e) { return false; }
   }
+  window.KA_IS_ADMIN = isAdminMode;
 
-  /* 保存先のファイル名（自分のIDに由来。他人の名前は使いません） */
+  /* ---------------- キー・パス ---------------- */
+  function keyStem(key) {
+    if (key.indexOf('f:') === 0 || key.indexOf('q:') === 0) return key.slice(2);
+    if (key.indexOf('l:') === 0) { var p = key.split(':'); return p[1] + '-' + (p[2] || 'main'); }
+    return key;
+  }
   function suggestPath(key, ext) {
     ext = ext || 'png';
     if (key.indexOf('f:') === 0) return 'assets/images/uploads/' + key.slice(2) + '.' + ext;
@@ -30020,98 +29981,176 @@ window.KA.del={ remove:removeItem, removeMany:removeMany, restore:restoreItem, r
       else if (key.indexOf('q:') === 0) d.patchQuestion(key.slice(2), { imagePath: path, image: path }, { noVersion: true });
       else if (key.indexOf('l:') === 0) {
         var p = key.split(':');
-        if (p[2] === 'thumb') d.patchLesson(p[1], { thumbnailPath: path });
-        else if (p[2] === 'person') d.patchLesson(p[1], { personImagePath: path });
-        else d.patchLesson(p[1], { mainImagePath: path });
+        if (p[2] === 'thumb') d.patchLesson(p[1], { thumbnailPath: path, thumbnailImage: path });
+        else if (p[2] === 'person') d.patchLesson(p[1], { personImagePath: path, personImage: path });
+        else d.patchLesson(p[1], { mainImagePath: path, mainImage: path });
       }
     } catch (e) { }
   }
+  function copyImg(fromKey, toKey) {
+    var im = IMG(); if (!im) return Promise.resolve(false);
+    var u = null; try { u = im.urlFor(fromKey); } catch (e) { }
+    if (!u) return Promise.resolve(false);
+    return fetch(u).then(function (r) { return r.blob(); }).then(function (b) {
+      var f;
+      try { f = new File([b], toKey.replace(/:/g, '-') + '.png', { type: b.type || 'image/png' }); } catch (e) { return false; }
+      return Promise.resolve(im.saveFile(f, toKey)).then(function () { return true; });
+    }).catch(function () { return false; });
+  }
+  function propagateFromCard(cardId) {
+    var d = D(); if (!d) return Promise.resolve(0);
+    var card = null;
+    try { d.flashcards().forEach(function (c) { if (c.id === cardId) card = c; }); } catch (e) { }
+    if (!card) return Promise.resolve(0);
+    var targets = [];
+    try {
+      d.questions().forEach(function (q) {
+        if (isGeneric(q.text)) return;
+        var m = 0; try { m = window.KA.plus.answerMatch(card, q); } catch (e) { }
+        if (m >= 2) targets.push(q);
+      });
+    } catch (e) { }
+    if (!targets.length) return Promise.resolve(0);
+    return Promise.all(targets.map(function (q) {
+      return copyImg('f:' + cardId, 'q:' + q.id).then(function (ok) {
+        if (ok) applyPath('q:' + q.id, suggestPath('q:' + q.id, 'png'));
+        return ok ? 1 : 0;
+      });
+    })).then(function (a) { return a.reduce(function (x, y) { return x + y; }, 0); });
+  }
 
-  /* ---------------- 2) 汎用問題文の誤共有を防止 ---------------- */
+  /* ---------------- 画像ボタンの不具合を修正 ---------------- */
+  function fixedBindImageSlots(root) {
+    var box = root || document;
+    if (!box.querySelectorAll) return;
+    box.querySelectorAll('[data-islot-pick]').forEach(function (btn) {
+      btn.onclick = function (ev) {
+        ev.preventDefault(); ev.stopPropagation();
+        var key = btn.getAttribute('data-islot-pick');
+        var slot = btn.closest('.img-slot') || btn.parentNode;
+        var inp = slot ? slot.querySelector('[data-islot-file]') : null;
+        if (!inp) inp = document.querySelector('[data-islot-file="' + key + '"]');
+        if (inp) inp.click(); else toast('画像の入力欄が見つかりませんでした', 'bad');
+      };
+    });
+    box.querySelectorAll('[data-islot-file]').forEach(function (inp) {
+      inp.onclick = function (ev) { ev.stopPropagation(); };
+      inp.onchange = function (ev) {
+        ev.stopPropagation();
+        var key = inp.getAttribute('data-islot-file');
+        var f = inp.files && inp.files[0];
+        inp.value = '';
+        if (!f || !key) return;
+        var im = IMG(); if (!im) { toast('画像を保存できません', 'bad'); return; }
+        toast('画像を保存しています…');
+        im.saveFile(f, key).then(function (rec) {
+          applyPath(key, suggestPath(key, im.extOf ? im.extOf(rec.type) : 'png'));
+          try { D().refresh(); } catch (e) { }
+          if (key.indexOf('f:') === 0) {
+            propagateFromCard(key.slice(2)).then(function (n) {
+              toast('画像を反映しました' + (n ? '（同じ内容のクイズ ' + n + ' 件にも）' : ''), 'good');
+              try { window.KA.rerender(); } catch (e) { }
+            });
+          } else { toast('画像を反映しました', 'good'); try { window.KA.rerender(); } catch (e) { } }
+        }).catch(function (e) { toast('失敗: ' + (e && e.message ? e.message : e), 'bad'); });
+      };
+    });
+    box.querySelectorAll('[data-islot-del]').forEach(function (btn) {
+      btn.onclick = function (ev) {
+        ev.preventDefault(); ev.stopPropagation();
+        var key = btn.getAttribute('data-islot-del');
+        if (!window.confirm('この画像を削除しますか？')) return;
+        var im = IMG(); if (!im) return;
+        im.del(key).then(function () {
+          applyPath(key, ''); try { D().refresh(); } catch (e) { }
+          toast('画像を削除しました', 'good');
+          try { window.KA.rerender(); } catch (e) { }
+        });
+      };
+    });
+  }
+  function patchBind() {
+    var u = window.KA && window.KA.ui;
+    if (!u) return false;
+    if (u.__kaFixedBind) return true;
+    u.bindImageSlots = fixedBindImageSlots; u.__kaFixedBind = true; return true;
+  }
   function guardShare() {
     var p = window.KA && window.KA.plus;
-    if (!p || p.__kaGuarded) return false;
-    var origMatch = p.matchPair;
+    if (!p) return false;
+    if (p.__kaGuarded) return true;
+    var om = p.matchPair;
     p.matchPair = function (c, q) {
       if (isGeneric(c && c.front) || isGeneric(q && q.text)) return false;
-      try { return origMatch ? origMatch(c, q) : false; } catch (e) { return false; }
+      try { return om ? om(c, q) : false; } catch (e) { return false; }
     };
-    var origFind = p.findBadShares;
+    var of = p.findBadShares;
     p.findBadShares = function () {
-      var out = [];
-      try { out = (origFind ? origFind() : []) || []; } catch (e) { out = []; }
-      return out.filter(function (x) { return !isGeneric(x && x.text); });
+      var o = []; try { o = (of ? of() : []) || []; } catch (e) { o = []; }
+      return o.filter(function (x) { return !isGeneric(x && x.text); });
     };
-    p.__kaGuarded = true;
-    return true;
+    p.__kaGuarded = true; return true;
   }
   window.KA_IS_GENERIC = isGeneric;
 
-  /* ---------------- 3) 画像を入れたもの一覧 ---------------- */
-  function ownStem(key) {
-    if (key.indexOf('f:') === 0 || key.indexOf('q:') === 0) return key.slice(2);
-    if (key.indexOf('l:') === 0) { var p = key.split(':'); return p[1] + '-' + (p[2] || 'main'); }
-    return key;
-  }
-  function baseStem(path) {
-    var b = String(path || '').split('/').pop() || '';
-    return b.replace(/\.[a-z0-9]+$/i, '');
-  }
-  function has(key) { var im = IMG(); if (!im) return false; try { return im.has(key) ? true : !!im.urlFor(key); } catch (e) { return false; } }
+  /* ---------------- 一覧 ---------------- */
+  function baseStem(p) { var b = String(p || '').split('/').pop() || ''; return b.replace(/\.[a-z0-9]+$/i, ''); }
   function urlOf(key) { var im = IMG(); try { return im.urlFor(key) || ''; } catch (e) { return ''; } }
 
   function collect() {
     var d = D(); if (!d) return [];
     var rows = [];
-    function push(kind, id, key, title, path, needs, editHref) {
-      var p = path || '';
-      var own = (p ? baseStem(p) === ownStem(key) : true);
-      var exists = has(key);
-      var st;
-      if (!exists && !p) st = 'none';                     /* 未設定 */
-      else if (p && !own) st = 'wrong';                   /* 他人の名前 ＝ 誤共有の疑い */
-      else if (exists) st = 'ok';
-      else st = 'missing';                                /* パスはあるが実体がない */
-      rows.push({ kind: kind, id: id, key: key, title: title, path: p, needs: !!needs, state: st, href: editHref, url: urlOf(key) });
+    function push(kind, kindName, id, key, title, path, href) {
+      var p = path || '', u = urlOf(key), st;
+      if (!u && !p) st = 'none';
+      else if (p && baseStem(p) !== keyStem(key)) st = 'wrong';
+      else if (u) st = 'ok';
+      else st = 'missing';
+      rows.push({ kind: kind, kindName: kindName, id: id, key: key, title: title, path: p, state: st, href: href, url: u });
     }
-    var cards = []; try { cards = d.flashcards ? d.flashcards() : []; } catch (e) { }
-    cards.forEach(function (c) {
-      var isDel = false; try { isDel = window.KA.plus.isRemoved ? window.KA.plus.isRemoved(c.id) : false; } catch (e) { }
-      if (isDel) return;
-      push('card', c.id, 'f:' + c.id, c.front || c.id, c.imagePath || c.image || '', c.needsImage !== false, '#/admin/card/' + c.id);
-    });
-    var qs = []; try { qs = d.questions ? d.questions() : []; } catch (e) { }
-    qs.forEach(function (q) {
-      push('question', q.id, 'q:' + q.id, q.text || q.id, q.imagePath || q.image || '', q.needsImage, '#/admin/question/' + q.id);
-    });
-    var ls = []; try { ls = d.lessons ? d.lessons() : []; } catch (e) { }
-    ls.forEach(function (l) {
-      if (l.mainImagePath || l.mainImage) push('lesson', l.id, 'l:' + l.id + ':main', l.title || l.id, l.mainImagePath || l.mainImage, true, '#/admin/lesson/' + l.id);
-      if (l.personImagePath || l.personImage) push('lesson', l.id, 'l:' + l.id + ':person', (l.title || l.id) + '（人物）', l.personImagePath || l.personImage, true, '#/admin/lesson/' + l.id);
-    });
-    /* 重複（同じ画像を複数が使っている）を検出 */
+    try {
+      d.flashcards().forEach(function (c) {
+        var del = false; try { del = window.KA.plus.isRemoved ? window.KA.plus.isRemoved(c.id) : false; } catch (e) { }
+        if (del) return;
+        push('card', '暗記カード', c.id, 'f:' + c.id, c.front || c.id, c.imagePath || c.image || '', '#/admin/card/' + c.id);
+      });
+    } catch (e) { }
+    try {
+      d.questions().forEach(function (q) {
+        push('question', 'クイズ', q.id, 'q:' + q.id, q.text || q.id, q.imagePath || q.image || '', '#/admin/question/' + q.id);
+      });
+    } catch (e) { }
+    try {
+      d.lessons().forEach(function (l) {
+        push('lesson', '学び', l.id, 'l:' + l.id + ':main', l.title || l.id, l.mainImagePath || l.mainImage || '', '#/admin/lesson/' + l.id);
+        if (l.personImagePath || l.personImage) push('lesson', '学び', l.id, 'l:' + l.id + ':person', l.title || l.id, l.personImagePath || l.personImage, '#/admin/lesson/' + l.id);
+      });
+    } catch (e) { }
     var by = {};
     rows.forEach(function (r) { if (r.path) { (by[r.path] = by[r.path] || []).push(r); } });
     rows.forEach(function (r) { r.dupes = (r.path && by[r.path]) ? by[r.path].length : 0; });
+    rows.sort(function (a, b) {
+      var order = { wrong: 0, ok: 1, missing: 2, none: 3 };
+      if (order[a.state] !== order[b.state]) return order[a.state] - order[b.state];
+      return String(a.title).localeCompare(String(b.title), 'ja');
+    });
     return rows;
   }
 
-  /* 誤共有の一掃：自分の名前でない画像パスを外す（持ち主の画像は残す） */
   function clearWrongShares() {
     var rows = collect().filter(function (r) { return r.state === 'wrong'; });
-    if (!rows.length) { toast('誤共有は見つかりませんでした', 'good'); return; }
-    var ok = window.confirm(rows.length + ' 件の画像が「他の項目の名前」になっています。\n自分の名前でない画像を外します（持ち主の画像は残ります）。よろしいですか？');
-    if (!ok) return;
+    if (!rows.length) { toast('名前が違う画像はありません', 'good'); return; }
+    if (!window.confirm(rows.length + ' 件の画像が、他の項目の名前になっています。\n自分の名前でない画像を外します（持ち主の画像は残ります）。\nよろしいですか？')) return;
     rows.forEach(function (r) {
       var im = IMG(); if (im) { try { im.del(r.key); } catch (e) { } }
       applyPath(r.key, '');
     });
     try { D().refresh(); } catch (e) { }
-    toast(rows.length + ' 件の誤共有を外しました。画像を入れ直してください。', 'good');
+    toast(rows.length + ' 件を外しました。画像を入れ直してください。', 'good');
     render(); try { window.KA.rerender(); } catch (e) { }
   }
 
-  /* ---------------- 4) 書き出し ---------------- */
+  /* ---------------- 書き出し（日時つきZIP・1フォルダ） ---------------- */
   var CT = (function () { var t = [], c, n, k; for (n = 0; n < 256; n++) { c = n; for (k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; } return t; })();
   function crc32(u8) { var c = 0xFFFFFFFF; for (var i = 0; i < u8.length; i++) c = CT[(c ^ u8[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
   function makeZip(files) {
@@ -30119,17 +30158,14 @@ window.KA.del={ remove:removeItem, removeMany:removeMany, restore:restoreItem, r
     files.forEach(function (f) {
       var nb = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
       var lh = new Uint8Array(30 + nb.length), dv = new DataView(lh.buffer);
-      dv.setUint32(0, 0x04034b50, true); dv.setUint16(4, 20, true); dv.setUint16(6, 0, true);
-      dv.setUint16(8, 0, true); dv.setUint16(10, 0, true); dv.setUint16(12, 0, true);
+      dv.setUint32(0, 0x04034b50, true); dv.setUint16(4, 20, true);
       dv.setUint32(14, crc, true); dv.setUint32(18, size, true); dv.setUint32(22, size, true);
-      dv.setUint16(26, nb.length, true); dv.setUint16(28, 0, true); lh.set(nb, 30);
+      dv.setUint16(26, nb.length, true); lh.set(nb, 30);
       chunks.push(lh, f.data);
       var ch = new Uint8Array(46 + nb.length), d2 = new DataView(ch.buffer);
       d2.setUint32(0, 0x02014b50, true); d2.setUint16(4, 20, true); d2.setUint16(6, 20, true);
-      d2.setUint16(8, 0, true); d2.setUint16(10, 0, true); d2.setUint16(12, 0, true); d2.setUint16(14, 0, true);
       d2.setUint32(16, crc, true); d2.setUint32(20, size, true); d2.setUint32(24, size, true);
-      d2.setUint16(28, nb.length, true); d2.setUint16(30, 0, true); d2.setUint16(32, 0, true);
-      d2.setUint16(34, 0, true); d2.setUint16(36, 0, true); d2.setUint32(38, 0, true); d2.setUint32(42, offset, true);
+      d2.setUint16(28, nb.length, true); d2.setUint32(42, offset, true);
       ch.set(nb, 46); central.push(ch); offset += lh.length + size;
     });
     var cs = central.reduce(function (a, b) { return a + b.length; }, 0);
@@ -30143,118 +30179,202 @@ window.KA.del={ remove:removeItem, removeMany:removeMany, restore:restoreItem, r
     a.href = u; a.download = name; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(function () { URL.revokeObjectURL(u); }, 5000);
   }
-  function outName(key, ext) { return key.replace(/:/g, '-') + '.' + (ext || 'png'); }
-
+  function stamp() {
+    var d = new Date(), p = function (n) { return (n < 10 ? '0' : '') + n; };
+    return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
+  }
   function exportAll() {
     var im = IMG(); if (!im) { toast('画像ストアを利用できません', 'bad'); return; }
-    var rows = collect();
-    var withImg = rows.filter(function (r) { return r.url; });
-    if (!withImg.length) { toast('書き出せる画像がありません', 'bad'); return; }
-    var files = [], map = {}, paths = {};
-    Promise.all(withImg.map(function (r) {
+    var rows = collect().filter(function (r) { return r.url; });
+    if (!rows.length) { toast('書き出せる画像がありません', 'bad'); return; }
+    var FOLDER = 'kaitori-images/';
+    var files = [], map = {}, used = {};
+    rows.forEach(function (r) {
+      var base = r.key.replace(/:/g, '-');
+      var nm = base; var i = 2;
+      while (used[nm]) { nm = base + '-' + i; i++; }   /* 念のため衝突回避 */
+      used[nm] = 1;
+      r.__nm = nm;
+      map[r.key] = { file: FOLDER + nm, kind: r.kindName, id: r.id, title: String(r.title).slice(0, 60) };
+    });
+    Promise.all(rows.map(function (r) {
       return fetch(r.url).then(function (res) { return res.blob(); }).then(function (b) {
-        var type = b.type || 'image/png';
-        var ext = type.indexOf('jpeg') >= 0 ? 'jpg' : (type.indexOf('webp') >= 0 ? 'webp' : 'png');
-        var nm = outName(r.key, ext);
-        map[r.key] = nm;
-        paths[r.key] = { kind: r.kind, id: r.id, path: 'assets/images/uploads/' + nm };
-        return b.arrayBuffer().then(function (buf) { files.push({ name: nm, data: new Uint8Array(buf) }); });
+        var t = b.type || 'image/png';
+        var ext = t.indexOf('jpeg') >= 0 ? 'jpg' : (t.indexOf('webp') >= 0 ? 'webp' : 'png');
+        var nm = r.__nm + '.' + ext;
+        map[r.key].file = FOLDER + nm;
+        return b.arrayBuffer().then(function (buf) { files.push({ name: FOLDER + nm, data: new Uint8Array(buf) }); });
       }).catch(function () { });
     })).then(function () {
-      var manifest = {
-        app: '買取アカデミー', kind: 'image-package', exportedAt: new Date().toISOString(),
-        note: 'このZIPを解凍し、中の画像を GitHub の assets /images/ に入れてください。対応表（このJSON）どおりに imagePath を更新すると確実です。',
-        count: files.length, map: map, paths: paths
-      };
-      files.push({ name: '画像の対応表.json', data: new TextEncoder().encode(JSON.stringify(manifest, null, 2)) });
-      files.push({ name: 'README.txt', data: new TextEncoder().encode(
-        '買取アカデミー 画像パッケージ\n\n' +
-        '1) このZIPを解凍します。\n' +
-        '2) 中の画像（' + map_len(map) + '枚）を GitHub の assets /images/ に入れます。\n' +
-        '3) commit → push すると、サイトに反映されます。\n\n' +
-        'ファイル名は変えないでください。\n'
-      ) });
-      dl('kaitori-images-' + files.length + '.zip', makeZip(files));
-      toast(files.length + ' 件を書き出しました', 'good');
+      var n = files.length;
+      files.push({
+        name: FOLDER + 'この画像の対応表.json', data: new TextEncoder().encode(JSON.stringify({
+          app: '買取アカデミー', kind: 'image-package', exportedAt: new Date().toISOString(), count: n, map: map
+        }, null, 2))
+      });
+      files.push({
+        name: FOLDER + 'README.txt', data: new TextEncoder().encode(
+          '買取アカデミー 画像パッケージ（' + n + '枚）\n\n' +
+          '1) このZIPを解凍します（フォルダが1つできます）。\n' +
+          '2) フォルダの中の画像（' + n + '枚）を、GitHub の assets /images/ に入れます。\n' +
+          '3) commit → push でサイトに反映されます。\n\n' +
+          'ファイル名は変えないでください。\n' +
+          '古い書き出しは使わないでください（新しいZIPだけを使ってください）。\n')
+      });
+      dl('kaitori-images-' + stamp() + '.zip', makeZip(files));
+      toast(n + ' 件を書き出しました（' + stamp() + '）', 'good');
     });
   }
-  function map_len(m) { var n = 0; for (var k in m) n++; return n; }
 
-  /* ---------------- 画面 ---------------- */
-  var filter = 'all';
-  function adminMode() { try { return window.KA.store.mode() === 'admin'; } catch (e) { return false; } }
+  /* ---------------- 動作確認 ---------------- */
+  function selfTest() {
+    var res = [];
+    function sync(name, fn) {
+      try { var r = fn(); res.push({ name: name, ok: r === true, why: r === true ? '' : String(r) }); }
+      catch (e) { res.push({ name: name, ok: false, why: e && e.message ? e.message : String(e) }); }
+    }
+    sync('管理者モードを検出できている', function () { return isAdminMode() ? true : '管理者モードに切り替えてから実行してください'; });
+    sync('画像ボタンの修正が当たっている', function () { return (window.KA.ui && window.KA.ui.__kaFixedBind) ? true : '未適用（再読み込みしてください）'; });
+    sync('同じ内容のクイズへの反映機能', function () { return (typeof propagateFromCard === 'function') ? true : 'なし'; });
+    sync('画像ストアが使える', function () { var im = IMG(); return (im && im.saveFile && im.urlFor && im.del) ? true : '画像ストアのAPIが見つかりません'; });
+    return new Promise(function (resolve) {
+      var im = IMG();
+      if (!im || !im.saveFile) { resolve({ name: '画像の保存→表示→削除', ok: false, why: '画像ストアが使えません' }); return; }
+      var done = false;
+      function fin(o) { if (done) return; done = true; resolve(o); }
+      setTimeout(function () { fin({ name: '画像の保存→表示→削除', ok: false, why: '時間内に完了しませんでした' }); }, 8000);
+      try {
+        var cv = document.createElement('canvas'); cv.width = 8; cv.height = 8;
+        var ctx = cv.getContext('2d'); ctx.fillStyle = '#2f6238'; ctx.fillRect(0, 0, 8, 8);
+        cv.toBlob(function (b) {
+          if (!b) { fin({ name: '画像の保存→表示→削除', ok: false, why: 'テスト画像を作れませんでした' }); return; }
+          var f = new File([b], 'ka-test.png', { type: 'image/png' });
+          Promise.resolve(im.saveFile(f, 'test:ka')).then(function () {
+            var u = null; try { u = im.urlFor('test:ka'); } catch (e) { }
+            if (!u) { fin({ name: '画像の保存→表示→削除', ok: false, why: '保存した画像が表示されません' }); return; }
+            Promise.resolve(im.del('test:ka')).then(function () { fin({ name: '画像の保存→表示→削除', ok: true, why: '' }); })
+              .catch(function (e) { fin({ name: '画像の保存→表示→削除', ok: false, why: '削除に失敗' }); });
+          }).catch(function (e) { fin({ name: '画像の保存→表示→削除', ok: false, why: '保存に失敗: ' + (e && e.message ? e.message : e) }); });
+        }, 'image/png');
+      } catch (e) { fin({ name: '画像の保存→表示→削除', ok: false, why: e && e.message ? e.message : String(e) }); }
+    }).then(function (extra) { res.push(extra); return res; });
+  }
+  window.__kaImgSelfTest = selfTest;
+
+  /* ---------------- 画面（インラインstyleで確実に整える） ---------------- */
+  var filter = 'ok', lastTest = null, busy = '';
+  var S = {
+    row: 'display:flex;gap:10px;align-items:center;background:#fff;border:1px solid #dde5cb;border-radius:12px;padding:9px;margin-bottom:8px',
+    th: 'flex:0 0 96px;width:96px;height:70px;border-radius:9px;overflow:hidden;background:#f4f7ee;border:1px solid #e6ecda;display:flex;align-items:center;justify-content:center',
+    img: 'width:100%;height:100%;object-fit:contain;display:block',
+    mid: 'flex:1 1 auto;min-width:0',
+    ttl: 'font-size:14px;font-weight:800;color:#26361d;line-height:1.5',
+    sub: 'font-size:11px;color:#8b9880;word-break:break-all;margin-top:2px',
+    act: 'flex:0 0 auto;display:flex;flex-direction:column;gap:5px;align-items:stretch',
+    btn: 'font-size:12px;font-weight:800;border:1px solid #dde5cb;background:#fff;color:#3d4a33;border-radius:999px;padding:7px 12px;cursor:pointer;font-family:inherit;text-align:center;text-decoration:none;white-space:nowrap',
+    bd: 'font-size:10px;font-weight:800;border-radius:999px;padding:4px 9px;text-align:center;white-space:nowrap',
+    chip: 'border:1px solid #dde5cb;background:#fff;color:#4a5a3f;border-radius:999px;padding:8px 13px;font-size:12.5px;font-weight:800;cursor:pointer;font-family:inherit',
+    chipOn: 'border:1px solid #2f6238;background:#2f6238;color:#fff;border-radius:999px;padding:8px 13px;font-size:12.5px;font-weight:800;cursor:pointer;font-family:inherit',
+    main: 'background:#d8b862;color:#1d2a18;border:0;border-radius:999px;padding:11px 16px;font-size:13px;font-weight:800;cursor:pointer;font-family:inherit',
+    sub2: 'background:#fff;color:#a2452c;border:1px solid #eed3c9;border-radius:999px;padding:11px 14px;font-size:12px;font-weight:800;cursor:pointer;font-family:inherit',
+    close: 'background:#fff;color:#4a5a3f;border:1px solid #dde5cb;border-radius:999px;padding:11px 16px;font-size:13px;font-weight:800;cursor:pointer;margin-left:auto;font-family:inherit'
+  };
+  var BADGE = {
+    ok: ['合っている', '#e7f0dc', '#2f6238'],
+    wrong: ['名前が違う', '#f7e6e1', '#a2452c'],
+    none: ['画像なし', '#f2f3ef', '#8b9880'],
+    missing: ['実体なし', '#fdf3dd', '#8a6410']
+  };
 
   function render() {
     var host = document.getElementById('kaImgAudit'); if (!host) return;
     var rows = collect();
     var nOk = rows.filter(function (r) { return r.state === 'ok'; }).length;
-    var nNo = rows.filter(function (r) { return r.state === 'none'; }).length;
-    var nBad = rows.filter(function (r) { return r.state === 'wrong'; }).length;
-    var nMis = rows.filter(function (r) { return r.state === 'missing'; }).length;
-    var view = rows;
-    if (filter === 'wrong') view = rows.filter(function (r) { return r.state === 'wrong'; });
+    var nWrong = rows.filter(function (r) { return r.state === 'wrong'; }).length;
+    var nNone = rows.filter(function (r) { return r.state === 'none'; }).length;
+    var nAll = rows.filter(function (r) { return r.state !== 'none'; }).length;
+    var view = rows.filter(function (r) { return r.state !== 'none'; });
+    if (filter === 'ok') view = rows.filter(function (r) { return r.state === 'ok'; });
+    else if (filter === 'wrong') view = rows.filter(function (r) { return r.state === 'wrong'; });
     else if (filter === 'none') view = rows.filter(function (r) { return r.state === 'none'; });
-    else if (filter === 'ok') view = rows.filter(function (r) { return r.state === 'ok'; });
+    else if (filter === 'card') view = rows.filter(function (r) { return r.kind === 'card' && r.state !== 'none'; });
+    else if (filter === 'question') view = rows.filter(function (r) { return r.kind === 'question' && r.state !== 'none'; });
+    else if (filter === 'lesson') view = rows.filter(function (r) { return r.kind === 'lesson' && r.state !== 'none'; });
 
-    var badge = {
-      ok: '<span class="kia-b ok">正しい</span>',
-      wrong: '<span class="kia-b wrong">名前が違う</span>',
-      none: '<span class="kia-b none">画像なし</span>',
-      missing: '<span class="kia-b missing">実体なし</span>'
-    };
-    var body = view.slice(0, 400).map(function (r) {
-      var thumb = r.url
-        ? '<img src="' + esc(r.url) + '" alt="">'
-        : '<span class="kia-ph">＋</span>';
-      return '<div class="kia-row" data-key="' + esc(r.key) + '">'
-        + '<div class="kia-th">' + thumb + '</div>'
-        + '<div class="kia-mid">'
-        + '<div class="kia-ttl">' + esc(String(r.title).slice(0, 46)) + '</div>'
-        + '<div class="kia-sub">' + esc(r.key) + (r.dupes > 1 ? '　同じ画像を ' + r.dupes + ' 件が使用' : '') + '</div>'
+    var body = view.slice(0, 300).map(function (r) {
+      var b = BADGE[r.state] || BADGE.none;
+      var th = r.url
+        ? '<img src="' + esc(r.url) + '" alt="" style="' + S.img + '">'
+        : '<span style="color:#a8b59a;font-size:22px;font-weight:800">＋</span>';
+      return '<div style="' + S.row + '">'
+        + '<div style="' + S.th + '">' + th + '</div>'
+        + '<div style="' + S.mid + '">'
+        + '<div style="' + S.ttl + '">' + esc(String(r.title).slice(0, 52)) + '</div>'
+        + '<div style="' + S.sub + '">' + esc(r.kindName) + '　' + esc(r.key)
+        + (r.dupes > 1 ? '　<span style="color:#a2452c;font-weight:800">この画像を' + r.dupes + '件が使用</span>' : '') + '</div>'
+        + '<div style="margin-top:6px"><span style="' + S.bd + ';background:' + b[1] + ';color:' + b[2] + '">' + b[0] + '</span></div>'
         + '</div>'
-        + '<div class="kia-act">' + (badge[r.state] || '')
-        + '<a class="kia-btn" href="' + esc(r.href) + '" data-open="1">開く</a>'
-        + '<button class="kia-btn" data-pick="' + esc(r.key) + '">変更</button>'
-        + (r.url ? '<button class="kia-btn del" data-del="' + esc(r.key) + '">削除</button>' : '')
+        + '<div style="' + S.act + '">'
+        + '<button style="' + S.btn + ';background:#2f6238;color:#fff;border-color:#2f6238" data-pick="' + esc(r.key) + '">変更</button>'
+        + '<a style="' + S.btn + '" href="' + esc(r.href) + '" data-open="1">内容を見る</a>'
+        + (r.url ? '<button style="' + S.btn + ';color:#a2452c;border-color:#eed3c9" data-del="' + esc(r.key) + '">削除</button>' : '')
         + '<input type="file" accept="image/*" hidden data-file="' + esc(r.key) + '">'
         + '</div></div>';
     }).join('');
 
-    host.innerHTML =
-      '<div class="kia-panel">'
-      + '<div class="kia-head">'
-      + '<h3>画像チェック</h3>'
-      + '<div class="kia-sum">正しい <b>' + nOk + '</b> ／ 画像なし <b>' + nNo + '</b> ／ 名前が違う <b class="r">' + nBad + '</b> ／ 実体なし <b>' + nMis + '</b></div>'
-      + '<div class="kia-tabs">'
-      + '<button data-f="all" class="' + (filter === 'all' ? 'on' : '') + '">すべて ' + rows.length + '</button>'
-      + '<button data-f="wrong" class="' + (filter === 'wrong' ? 'on' : '') + '">名前が違う ' + nBad + '</button>'
-      + '<button data-f="none" class="' + (filter === 'none' ? 'on' : '') + '">画像なし ' + nNo + '</button>'
-      + '<button data-f="ok" class="' + (filter === 'ok' ? 'on' : '') + '">正しい ' + nOk + '</button>'
-      + '</div>'
-      + '<div class="kia-tools">'
-      + '<button class="kia-main" data-tool="clear">誤共有を外す（' + nBad + '）</button>'
-      + '<button class="kia-main" data-tool="export">画像を書き出す</button>'
-      + '<button class="kia-close" data-tool="close">閉じる</button>'
-      + '</div></div>'
-      + '<div class="kia-list">' + (body || '<p class="kia-empty">該当する項目はありません。</p>') + '</div>'
-      + '<div class="kia-note">「名前が違う」＝他の項目の画像名になっている状態です。「誤共有を外す」を押すと、持ち主の画像だけを残して外します。その後、1件ずつ「変更」で入れ直してください。「開く」で内容を確認できます。</div>'
-      + '</div>';
+    var testHtml = lastTest
+      ? '<div style="margin-top:10px;background:#fff;border:1px solid #dde5cb;border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:2">'
+        + lastTest.map(function (t) {
+          return '<div>' + (t.ok ? '✅' : '❌') + ' ' + esc(t.name) + (t.why ? '　<span style="color:#a2452c">' + esc(t.why) + '</span>' : '') + '</div>';
+        }).join('') + '</div>'
+      : '';
 
-    host.querySelectorAll('[data-f]').forEach(function (b) {
-      b.onclick = function () { filter = b.getAttribute('data-f'); render(); };
-    });
+    host.innerHTML =
+      '<div style="max-width:920px;margin:0 auto;padding:14px 12px 70px;font-family:inherit;color:#26361d">'
+      + '<div style="position:sticky;top:0;background:rgba(240,244,235,.99);padding:2px 0 9px;border-bottom:1px solid #dde5cb;z-index:2">'
+      + '<div style="display:flex;align-items:center;gap:8px">'
+      + '<h3 style="margin:0;font-size:19px;color:#26361d;font-weight:800">画像チェック</h3>'
+      + '<button style="' + S.close + '" data-tool="close">閉じる</button>'
+      + '</div>'
+      + '<div style="font-size:12.5px;color:#5c6b4e;margin:6px 0 8px">合っている <b style="color:#2f6238">' + nOk + '</b>　画像なし <b>' + nNone + '</b>　名前が違う <b style="color:#c2593c">' + nWrong + '</b></div>'
+      + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">'
+      + '<button style="' + (filter === 'ok' ? S.chipOn : S.chip) + '" data-f="ok">合っている ' + nOk + '</button>'
+      + '<button style="' + (filter === 'wrong' ? S.chipOn : S.chip) + '" data-f="wrong">名前が違う ' + nWrong + '</button>'
+      + '<button style="' + (filter === 'none' ? S.chipOn : S.chip) + '" data-f="none">画像なし ' + nNone + '</button>'
+      + '<button style="' + (filter === 'all' ? S.chipOn : S.chip) + '" data-f="all">画像あり ' + nAll + '</button>'
+      + '</div>'
+      + '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">'
+      + '<button style="' + (filter === 'card' ? S.chipOn : S.chip) + '" data-f="card">暗記カード</button>'
+      + '<button style="' + (filter === 'question' ? S.chipOn : S.chip) + '" data-f="question">クイズ</button>'
+      + '<button style="' + (filter === 'lesson' ? S.chipOn : S.chip) + '" data-f="lesson">学び</button>'
+      + '</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">'
+      + '<button style="' + S.main + '" data-tool="export">画像を書き出す</button>'
+      + '<button style="' + S.chip + '" data-tool="test">動作確認</button>'
+      + '<button style="' + S.sub2 + '" data-tool="clear">誤共有を外す（' + nWrong + '）</button>'
+      + '</div>' + testHtml
+      + '</div>'
+      + (busy ? '<div style="margin-top:10px;font-size:13px;color:#5c6b4e">' + esc(busy) + '</div>' : '')
+      + '<div style="margin-top:12px">' + (body || '<p style="text-align:center;color:#8b9880;padding:34px 0">該当する項目はありません。</p>') + '</div>'
+      + '<div style="margin-top:12px;font-size:12px;color:#6f7c62;line-height:1.85;background:#f6f9f0;border-left:3px solid #d8b862;border-radius:0 8px 8px 0;padding:10px 12px">'
+      + '画像と内容を見くらべて、合っていればそのまま。違っていれば「変更」で入れ直してください。<br>'
+      + '暗記カードの画像を変えると、同じ内容のクイズにも自動で反映されます。'
+      + '</div></div>';
+
+    host.querySelectorAll('[data-f]').forEach(function (b) { b.onclick = function () { filter = b.getAttribute('data-f'); render(); }; });
     host.querySelectorAll('[data-tool]').forEach(function (b) {
       b.onclick = function () {
         var t = b.getAttribute('data-tool');
         if (t === 'clear') clearWrongShares();
-        else if (t === 'export') exportAll();
-        else host.style.display = 'none';
+        else if (t === 'export') { busy = '書き出しています…'; render(); exportAll(); setTimeout(function () { busy = ''; render(); }, 1500); }
+        else if (t === 'close') host.style.display = 'none';
+        else if (t === 'test') { lastTest = [{ name: '確認中…', ok: true, why: '' }]; render(); selfTest().then(function (r) { lastTest = r; render(); }); }
       };
     });
     host.querySelectorAll('[data-pick]').forEach(function (b) {
       b.onclick = function () {
         var inp = host.querySelector('[data-file="' + b.getAttribute('data-pick') + '"]');
-        if (inp) inp.click();
+        if (inp) inp.click(); else toast('入力欄が見つかりませんでした', 'bad');
       };
     });
     host.querySelectorAll('[data-file]').forEach(function (inp) {
@@ -30263,13 +30383,18 @@ window.KA.del={ remove:removeItem, removeMany:removeMany, restore:restoreItem, r
         var f = inp.files && inp.files[0]; inp.value = '';
         if (!f || !key) return;
         var im = IMG(); if (!im) return;
-        toast('保存しています…');
+        busy = '画像を保存しています…'; render();
         im.saveFile(f, key).then(function (rec) {
           applyPath(key, suggestPath(key, im.extOf ? im.extOf(rec.type) : 'png'));
           try { D().refresh(); } catch (e) { }
-          toast('画像を反映しました', 'good');
-          render(); try { window.KA.rerender(); } catch (e) { }
-        }).catch(function (e) { toast('失敗: ' + (e && e.message ? e.message : e), 'bad'); });
+          busy = '';
+          if (key.indexOf('f:') === 0) {
+            propagateFromCard(key.slice(2)).then(function (n2) {
+              toast('画像を反映しました' + (n2 ? '（同じ内容のクイズ ' + n2 + ' 件にも）' : ''), 'good');
+              render(); try { window.KA.rerender(); } catch (e) { }
+            });
+          } else { toast('画像を反映しました', 'good'); render(); try { window.KA.rerender(); } catch (e) { } }
+        }).catch(function (e) { busy = ''; render(); toast('失敗: ' + (e && e.message ? e.message : e), 'bad'); });
       };
     });
     host.querySelectorAll('[data-del]').forEach(function (b) {
@@ -30277,77 +30402,40 @@ window.KA.del={ remove:removeItem, removeMany:removeMany, restore:restoreItem, r
         var key = b.getAttribute('data-del');
         if (!window.confirm('この画像を削除しますか？')) return;
         var im = IMG(); if (!im) return;
-        im.del(key).then(function () { applyPath(key, ''); try { D().refresh(); } catch (e) { } render(); });
+        im.del(key).then(function () { applyPath(key, ''); try { D().refresh(); } catch (e) { } toast('削除しました', 'good'); render(); try { window.KA.rerender(); } catch (e) { } });
       };
     });
-    host.querySelectorAll('[data-open]').forEach(function (a) {
-      a.onclick = function () { setTimeout(function () { try { host.style.display = 'none'; } catch (e) { } }, 60); };
-    });
+    host.querySelectorAll('[data-open]').forEach(function (a) { a.onclick = function () { host.style.display = 'none'; }; });
   }
 
   function mount() {
-    if (!adminMode()) { var h = document.getElementById('kaImgAudit'); if (h) h.style.display = 'none'; var f = document.getElementById('kaImgFab'); if (f) f.style.display = 'none'; return; }
-    if (document.getElementById('kaImgFab')) { var f2 = document.getElementById('kaImgFab'); f2.style.display = 'block'; return; }
-    var st = document.createElement('style');
-    st.textContent = ''
-      + '#kaImgFab{position:fixed;right:14px;bottom:calc(150px + env(safe-area-inset-bottom,0px));z-index:9000;'
-      + 'background:#2f6238;color:#fff;border:0;border-radius:999px;padding:11px 16px;font-size:13px;font-weight:800;'
-      + 'box-shadow:0 8px 22px rgba(0,0,0,.28);cursor:pointer;font-family:inherit}'
-      + '#kaImgAudit{position:fixed;inset:0;z-index:9500;background:rgba(240,244,235,.98);overflow:auto;display:none}'
-      + '#kaImgAudit .kia-panel{max-width:900px;margin:0 auto;padding:16px 14px 60px}'
-      + '#kaImgAudit .kia-head{position:sticky;top:0;background:rgba(240,244,235,.98);padding-bottom:8px;border-bottom:1px solid #dde5cb;z-index:2}'
-      + '#kaImgAudit h3{margin:0 0 6px;font-size:18px;color:#26361d}'
-      + '#kaImgAudit .kia-sum{font-size:13px;color:#5c6b4e;margin-bottom:8px}'
-      + '#kaImgAudit .kia-sum b{color:#2f6238}'
-      + '#kaImgAudit .kia-sum b.r{color:#c2593c}'
-      + '#kaImgAudit .kia-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}'
-      + '#kaImgAudit .kia-tabs button{border:1px solid #dde5cb;background:#fff;color:#4a5a3f;border-radius:999px;padding:6px 12px;font-size:12px;font-weight:700;cursor:pointer;font-family:inherit}'
-      + '#kaImgAudit .kia-tabs button.on{background:#2f6238;color:#fff;border-color:#2f6238}'
-      + '#kaImgAudit .kia-tools{display:flex;gap:8px;flex-wrap:wrap}'
-      + '#kaImgAudit .kia-main{background:#d8b862;color:#1d2a18;border:0;border-radius:999px;padding:10px 16px;font-size:13px;font-weight:800;cursor:pointer;font-family:inherit}'
-      + '#kaImgAudit .kia-close{background:#fff;color:#4a5a3f;border:1px solid #dde5cb;border-radius:999px;padding:10px 16px;font-size:13px;font-weight:700;cursor:pointer;margin-left:auto;font-family:inherit}'
-      + '#kaImgAudit .kia-list{margin-top:12px}'
-      + '#kaImgAudit .kia-row{display:flex;gap:10px;align-items:center;background:#fff;border:1px solid #dde5cb;border-radius:12px;padding:8px;margin-bottom:8px}'
-      + '#kaImgAudit .kia-th{flex:0 0 54px;width:54px;height:42px;border-radius:8px;overflow:hidden;background:#f4f7ee;display:flex;align-items:center;justify-content:center}'
-      + '#kaImgAudit .kia-th img{width:100%;height:100%;object-fit:contain}'
-      + '#kaImgAudit .kia-ph{color:#a8b59a;font-size:18px;font-weight:800}'
-      + '#kaImgAudit .kia-mid{flex:1 1 auto;min-width:0}'
-      + '#kaImgAudit .kia-ttl{font-size:13px;font-weight:700;color:#26361d;line-height:1.45}'
-      + '#kaImgAudit .kia-sub{font-size:10.5px;color:#8b9880;word-break:break-all}'
-      + '#kaImgAudit .kia-act{flex:0 0 auto;display:flex;align-items:center;gap:5px;flex-wrap:wrap;justify-content:flex-end;max-width:230px}'
-      + '#kaImgAudit .kia-b{font-size:10px;font-weight:800;border-radius:999px;padding:3px 8px}'
-      + '#kaImgAudit .kia-b.ok{background:#e7f0dc;color:#2f6238}'
-      + '#kaImgAudit .kia-b.wrong{background:#f7e6e1;color:#a2452c}'
-      + '#kaImgAudit .kia-b.none{background:#f2f3ef;color:#8b9880}'
-      + '#kaImgAudit .kia-b.missing{background:#fdf3dd;color:#8a6410}'
-      + '#kaImgAudit .kia-btn{font-size:11px;font-weight:700;border:1px solid #dde5cb;background:#fff;color:#3d4a33;border-radius:999px;padding:5px 10px;cursor:pointer;text-decoration:none;font-family:inherit}'
-      + '#kaImgAudit .kia-btn.del{color:#a2452c;border-color:#eed3c9}'
-      + '#kaImgAudit .kia-note{margin-top:12px;font-size:11.5px;color:#6f7c62;line-height:1.8;background:#f6f9f0;border-left:3px solid #d8b862;border-radius:0 8px 8px 0;padding:10px 12px}'
-      + '#kaImgAudit .kia-empty{text-align:center;color:#8b9880;padding:30px 0}';
-    document.head.appendChild(st);
-
-    var fab = document.createElement('button');
-    fab.id = 'kaImgFab'; fab.type = 'button'; fab.textContent = '画像チェック';
-    fab.onclick = function () {
-      var h = document.getElementById('kaImgAudit');
-      h.style.display = 'block'; filter = 'all'; render();
-    };
-    document.body.appendChild(fab);
-
+    var fab = document.getElementById('kaImgFab');
+    if (!isAdminMode()) { if (fab) fab.style.display = 'none'; var h0 = document.getElementById('kaImgAudit'); if (h0) h0.style.display = 'none'; return; }
+    if (fab) { fab.style.display = 'block'; return; }
+    var fab2 = document.createElement('button');
+    fab2.id = 'kaImgFab'; fab2.type = 'button'; fab2.textContent = '画像チェック';
+    fab2.setAttribute('style', 'position:fixed;right:12px;bottom:calc(150px + env(safe-area-inset-bottom,0px));z-index:9000;'
+      + 'background:#2f6238;color:#fff;border:2px solid #d8b862;border-radius:999px;padding:12px 17px;font-size:13.5px;font-weight:800;'
+      + 'box-shadow:0 8px 22px rgba(0,0,0,.3);cursor:pointer;font-family:inherit');
+    fab2.onclick = function () { document.getElementById('kaImgAudit').style.display = 'block'; render(); };
+    document.body.appendChild(fab2);
     var host = document.createElement('div');
     host.id = 'kaImgAudit';
+    host.setAttribute('style', 'position:fixed;inset:0;z-index:9500;background:#f0f4eb;overflow:auto;display:none;-webkit-overflow-scrolling:touch');
     document.body.appendChild(host);
   }
 
   try { patchBind(); guardShare(); } catch (e) { }
   var n = 0, t = setInterval(function () {
     n++;
-    try { patchBind(); guardShare(); } catch (e) { }
-    if (n > 200) clearInterval(t);
+    try { patchBind(); guardShare(); mount(); } catch (e) { }
+    if (n > 600) clearInterval(t);
   }, 100);
-  setInterval(function () { try { mount(); } catch (e) { } }, 1200);
-
-  window.KA.imgAudit = { collect: collect, render: render, isGeneric: isGeneric, clearWrongShares: clearWrongShares, exportAll: exportAll };
+  window.KA.imgAudit = {
+    collect: collect, render: render, refresh: render, selfTest: selfTest,
+    clearWrongShares: clearWrongShares, exportAll: exportAll, isAdminMode: isAdminMode,
+    propagateFromCard: propagateFromCard, isGeneric: isGeneric, mount: mount
+  };
 })();
 
 </script>
