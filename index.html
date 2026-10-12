@@ -29672,25 +29672,26 @@ window.KA.del={ remove:removeItem, removeMany:removeMany, restore:restoreItem, r
 (function(){
 "use strict";
 /* ==========================================================================
-   買取アカデミー — 配布画像の「必要時のみ」読み込み（v2 / スマホ軽量化版）
-   ねらい：起動時に710枚をまとめて取りに行かない／スマホを固まらせない
-   ・起動時に読むのは「最初の画面に必要なぶん」だけ
-   ・画面が要求した画像（urlFor が呼ばれたもの）を優先して取得
-   ・その教材のページを開いているときは、その教材の画像を最優先
-   ・操作（スクロール・タップ）やページ移動のたびに、少しずつ続きを読む
-   ・通信と操作が落ち着いている間だけ、残りを1枚ずつ静かに先読み
-   ・読み込み表示は操作をブロックしない（pointer-events:none・件数なし）
-   ・取得先URLの候補順は従来どおり（GitHub上の置き場所は変更なし）
+   買取アカデミー — 配布画像の「必要時のみ」読み込み（v3 / スマホ軽量化版）
+   v2からの変更点
+     ・置き場所（assets/images/ か 旧 assets /images/ か）と拡張子（.webp か .png か）を
+       起動時に1回だけ確認してから読み込む ＝ 無駄な404アクセスを出さない
+     ・WebP変換後は、ほぼ1枚＝1リクエストで取得できる
+     ・サーバーがMIMEタイプを返さない場合でも画像として保存する（表示できない不具合の修正）
+   ねらい: 起動時に710枚をまとめて取りに行かない／スマホを固まらせない
    ========================================================================== */
 var K=window.KA,B=window.KA_BAKED;
 if(!K||!K.images||typeof K.images.put!=="function")return;
 if(!B||!B.manifest||!B.manifest.length)return;
 
 var STORE_FLAG="ka_dist_images_loaded";
+var PROBE_KEY="ka_img_probe_v1";
 var ver="d5|"+B.v;
 var list=B.manifest,byKey={},n;
 for(n=0;n<list.length;n++)byKey[list[n].k]=list[n];
 
+var DIRS=["assets/images/","assets/images/dist/","assets/images/uploads/",
+          "assets%20/images/","assets%20/images/dist/","assets/dist/"];
 var MOBILE=/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent||"")||
   (window.matchMedia&&window.matchMedia("(max-width: 820px)").matches);
 var MAXC=MOBILE?1:2;             /* 同時に取りに行く本数 */
@@ -29706,12 +29707,12 @@ try{
   if(conn&&(conn.saveData||/^(slow-)?2g$/.test(String(conn.effectiveType||""))))PREFETCH=false;
 }catch(e){}
 
+var pickDir=DIRS[0],pickExt=".webp",probed=false;
 var DONE={},MISS={},queued={},urgent=[],busy=0,bgIndex=0,tokens=CAP,
     storeReady=false,timerOn=false,finished=false,bgFrom=Date.now()+BG_START,
     lastInput=Date.now(),lastGrant=0,badgeEl=null,badgeTimer=null,
     redrawTimer=null,gotNew=false;
 
-/* いま開いている教材の画像かどうか（URLのハッシュに教材IDが入っているかで判定） */
 function routeHit(key){
   var h="";
   try{h=String(location.hash||"");}catch(e){return false;}
@@ -29728,35 +29729,38 @@ function keyStems(k){
   if(p[0]==="l"){var id=p[1],sfx=p[2]||"main";return [id+"-"+sfx,id];}
   return [p[1]||""];
 }
-function cands(f,k){
-  var D=[];function dadd(x){if(x&&D.indexOf(x)<0)D.push(x);}
-  dadd("assets%20/images/");          /* ← GitHub上の実際の置き場所（'assets ' 末尾スペース） */
-  dadd("assets/images/dist/");        /* ← 本来クリーンな置き場所 */
-  dadd("assets%20/images/dist/");
-  dadd("assets/images/");
-  dadd("assets/images/uploads/");
-  dadd("assets/dist/");
-  try{if(B.dir)dadd(B.dir);}catch(e){}
-  var out=[];function add(x){if(x&&out.indexOf(x)<0)out.push(x);}
-  var stems=[],m=/^(.*)\.([a-z0-9]+)$/i.exec(f);
-  if(m){stems.push(m[1]);}else{stems.push(f);}
-  try{keyStems(k).forEach(function(s){if(s&&stems.indexOf(s)<0)stems.push(s);});}catch(e){}
-  var exts=[".png",".jpg",".jpeg",".webp",".gif"];
-  stems.forEach(function(st){exts.forEach(function(e){D.forEach(function(d){add(d+st+e);});});});
+function extOfUrl(u){var m=/\.([a-z0-9]+)(?:\?|#|$)/i.exec(String(u||""));return m?"."+m[1].toLowerCase():null;}
+function urlsFor(f,k){
+  var out=[],add=function(x){if(x&&out.indexOf(x)<0)out.push(x);};
+  var m=/^(.*)\.([A-Za-z0-9]+)$/i.exec(String(f||""));
+  var stems=[m?m[1]:String(f||"")];
+  keyStems(k).forEach(function(s){if(s&&stems.indexOf(s)<0)stems.push(s);});
+  var oext=m?"."+m[2].toLowerCase():null,exts=[];
+  [pickExt,oext,".webp",".png",".jpg",".jpeg",".gif"].forEach(function(x){if(x&&exts.indexOf(x)<0)exts.push(x);});
+  var dirs=[pickDir].concat(DIRS).filter(function(d,i,a){return d&&a.indexOf(d)===i;});
+  dirs.forEach(function(d){stems.forEach(function(st){exts.forEach(function(x){add(d+st+x);});});});
   return out;
+}
+function guessType(u){
+  var e=extOfUrl(u);
+  if(e===".png")return "image/png";
+  if(e===".webp")return "image/webp";
+  if(e===".gif")return "image/gif";
+  return "image/jpeg";
 }
 function tryFetch(l,n){
   if(n>=l.length)return Promise.resolve(null);
   return fetch(l[n],{cache:"force-cache"}).then(function(r){
     if(!r||!r.ok)return tryFetch(l,n+1);
-    return r.blob();
+    return r.blob().then(function(b){return {blob:b,url:l[n]};});
   }).catch(function(){return tryFetch(l,n+1);});
 }
 function loadOne(en){
   busy++;
-  return tryFetch(cands(en.f,en.k),0).then(function(b){
-    if(!b){MISS[en.k]=Date.now();return null;}
-    var blob=(b&&b.type)?b:new Blob([b],{type:"image/jpeg"});
+  return tryFetch(urlsFor(en.f,en.k),0).then(function(r){
+    if(!r){MISS[en.k]=Date.now();return null;}
+    var blob=r.blob;
+    if(!blob||!blob.type)blob=new Blob([blob],{type:guessType(r.url)});
     return Promise.resolve(K.images.put(en.k,blob,{name:en.f})).then(function(){
       DONE[en.k]=1;delete MISS[en.k];return en;
     });
@@ -29796,7 +29800,6 @@ function scheduleRedraw(){
   },700);
 }
 
-/* --- 待ち行列（画面が必要とした画像） --- */
 function push(en,front){
   var e={k:en.k,f:en.f,stale:false};
   if(front)urgent.unshift(e);else urgent.push(e);
@@ -29820,7 +29823,6 @@ function need(key){
   if(DONE[key])return;
   var old=queued[key];
   if(old){
-    /* その教材のページを開いたら、待ち行列の先頭へ */
     if(!old.stale&&routeHit(key)&&urgent[0]!==old){old.stale=true;push(byKey[key],true);}
     return;
   }
@@ -29832,8 +29834,6 @@ function need(key){
   showBadge();
   start();
 }
-
-/* --- 遅延先読み（無操作のときだけ、1枚ずつ） --- */
 function nextBackground(){
   if(!PREFETCH)return null;
   var spins=0;
@@ -29849,10 +29849,10 @@ function nextBackground(){
 }
 
 function tick(){
+  if(!probed){setTimeout(tick,300);return;}
   if(!storeReady){setTimeout(tick,300);return;}
   if(document.hidden){setTimeout(tick,1500);return;}
 
-  /* 1) 画面に必要な画像を優先 */
   if(urgent.length&&busy<MAXC){
     var head=headQueued();
     if(head&&(DONE[head.k]||storeHas(head.k))){DONE[head.k]=1;nextQueued();setTimeout(tick,GAP);return;}
@@ -29867,7 +29867,6 @@ function tick(){
   if(urgent.length&&busy>=MAXC){setTimeout(tick,GAP);return;}
   hideBadge();
 
-  /* 2) 通信と操作が落ち着いている間だけ、遅延して先読み */
   if(PREFETCH&&Date.now()>=bgFrom&&Date.now()-lastInput>=BG_IDLE){
     var bg=nextBackground();
     if(bg){loadOne(bg);setTimeout(tick,GAP);return;}
@@ -29901,6 +29900,30 @@ function markInput(){
 });
 try{window.addEventListener("hashchange",function(){lastInput=Date.now();tokens=Math.max(tokens,CAP);start();});}catch(e){}
 
+/* --- 置き場所と拡張子を1回だけ確認（無駄な404を出さないため） --- */
+function probe(cb){
+  var cached=null;
+  try{cached=JSON.parse(localStorage.getItem(PROBE_KEY)||"null");}catch(e){}
+  if(cached&&cached.v===B.v&&cached.dir&&cached.ext){pickDir=cached.dir;pickExt=cached.ext;probed=true;return cb();}
+  var sample=null;
+  for(var i=0;i<list.length;i++){if(list[i].f&&/\.[A-Za-z0-9]+$/.test(list[i].f)){sample=list[i];break;}}
+  if(!sample){probed=true;return cb();}
+  var m=/^(.*)\.([A-Za-z0-9]+)$/.exec(sample.f),stem=m[1],oext="."+m[2].toLowerCase();
+  var tries=[["assets/images/",".webp"],["assets/images/",oext],["assets/images/",".jpg"],
+             ["assets%20/images/",oext],["assets%20/images/",".webp"],["assets/images/dist/",".webp"]];
+  (function step(i){
+    if(i>=tries.length){probed=true;return cb();}
+    var d=tries[i][0],x=tries[i][1];
+    fetch(d+stem+x,{cache:"force-cache"}).then(function(r){
+      if(r&&r.ok){
+        pickDir=d;pickExt=x;probed=true;
+        try{localStorage.setItem(PROBE_KEY,JSON.stringify({v:B.v,dir:d,ext:x}));}catch(e){}
+        cb();
+      }else step(i+1);
+    }).catch(function(){step(i+1);});
+  })(0);
+}
+
 /* --- 画像ストアが使えるようになってから動かす --- */
 try{
   Promise.resolve(K.images.ready()).then(function(){storeReady=true;},function(){storeReady=true;});
@@ -29924,11 +29947,13 @@ window.KA.distImages={
   loadAll:function(){tokens=999999;PREFETCH=true;bgFrom=0;start();},
   status:function(){
     var miss=0,k;for(k in MISS)miss++;
-    return {total:list.length,loaded:Object.keys(DONE).length,waiting:urgent.length,
-            busy:busy,tokens:tokens,prefetch:PREFETCH,missing:miss};
+    return {dir:pickDir,ext:pickExt,total:list.length,loaded:Object.keys(DONE).length,
+            waiting:urgent.length,busy:busy,tokens:tokens,prefetch:PREFETCH,missing:miss};
   },
   missing:function(){var out=[],k;for(k in MISS){var en=byKey[k];out.push(en?en.f:k);}return out;}
 };
+
+probe(function(){start();});
 })();
 </script>
 <style id="kaStudyBar">
