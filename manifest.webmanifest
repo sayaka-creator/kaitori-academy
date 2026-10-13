@@ -1,0 +1,17 @@
+{
+  "name": "買取アカデミー",
+  "short_name": "買取アカデミー",
+  "description": "買取査定員のための学習サイト。ブランド知識・金相場・査定ポイント・接客トークを、毎日すこしずつ学べます。",
+  "lang": "ja",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#fbf8ec",
+  "theme_color": "#2f6238",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
