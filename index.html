@@ -4,6 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#2f6238">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="買取アカデミー">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="description" content="買取査定員のための学習サイト「買取アカデミー」。ブランド知識・金相場・査定ポイント・接客トークを、毎日すこしずつ学べます。">
 <meta name="format-detection" content="telephone=no">
 <title>買取アカデミー | 知識を、接客の自信に。</title>
@@ -29956,6 +29962,324 @@ window.KA.distImages={
 probe(function(){start();});
 })();
 </script>
+<script id="kaPackImport">
+(function(){
+"use strict";
+/* ==========================================================================
+   買取アカデミー — 画像パッケージの一括取り込み（初回セットアップ）
+   ・リポジトリ直下の images-pack.zip（必要なら images-pack-2.zip …）を
+     1回の通信でまとめて取り込み、端末の画像ストアへ入れる
+   ・ZIPは「無圧縮(store)」で作るので、解凍ライブラリがなくても全端末で動く
+      （deflate のZIPにも対応。対応端末のみ）
+   ・取り込めた画像は、以後どのページでも通信なしで即表示
+   ・うまくいかない端末は、これまでどおり必要な分だけ順に読む方式へ自動で戻る
+   ========================================================================== */
+var K=window.KA,B=window.KA_BAKED;
+if(!K||!K.images||!B||!B.manifest||!B.manifest.length)return;
+
+var PACK_BASE="images-pack";
+var MAX_PARTS=8;
+var FLAG="ka_pack_imported_v1";      /* 取り込み済みのバージョン */
+var CHECK="ka_pack_checked_v1";      /* 存在確認をしたバージョン */
+var SEEN="ka_pack_seen_session";     /* 同じ起動中に何度も出さない */
+var DISMISS="ka_pack_dismiss_v1";      /* 「あとで」を押した回数 */
+var ver=(B&&B.v)||"v";
+
+/* ---------- ファイル名 → 画像キー の対応表 ---------- */
+function cleanStem(n){
+  var m=/^(.*)\.([A-Za-z0-9]+)$/.exec(String(n||""));
+  var st=m?m[1]:String(n||"");
+  st=st.replace(/\s*\(\d+\)\s*$/,"");
+  return st.toLowerCase();
+}
+var stemMap={};
+(function(){
+  var mf=B.manifest;
+  for(var i=0;i<mf.length;i++){
+    var e=mf[i],stems=[cleanStem(e.f)],p=String(e.k||"").split(":");
+    if(p[0]==="l"){stems.push(cleanStem(p[1]+"-"+(p[2]||"main")));stems.push(cleanStem(p[1]));}
+    else if(p[0]==="f"||p[0]==="q"){stems.push(cleanStem(p[1]));}
+    for(var j=0;j<stems.length;j++){
+      var s=stems[j];
+      if(!s)continue;
+      var arr=stemMap[s];
+      if(!arr){arr=stemMap[s]=[];}
+      if(arr.indexOf(e.k)<0)arr.push(e.k);
+    }
+  }
+})();
+
+/* ---------- ZIPを読む（無圧縮＋deflate対応） ---------- */
+function readEntries(buf){
+  var u8=new Uint8Array(buf),dv=new DataView(buf);
+  var eocd=-1,from=Math.max(0,u8.length-22-65535);
+  for(var i=u8.length-22;i>=from;i--){
+    if(dv.getUint32(i,true)===0x06054b50){eocd=i;break;}
+  }
+  if(eocd<0)return null;
+  var count=dv.getUint16(eocd+10,true),cdOff=dv.getUint32(eocd+16,true);
+  var out=[],p=cdOff;
+  for(var n=0;n<count;n++){
+    if(dv.getUint32(p,true)!==0x02014b50)break;
+    var method=dv.getUint16(p+10,true);
+    var csize=dv.getUint32(p+20,true);
+    var nlen=dv.getUint16(p+28,true),elen=dv.getUint16(p+30,true),clen=dv.getUint16(p+32,true);
+    var lho=dv.getUint32(p+42,true);
+    var name="";
+    try{name=new TextDecoder("utf-8").decode(u8.subarray(p+46,p+46+nlen));}catch(e){}
+    if(lho===0xFFFFFFFF||csize===0xFFFFFFFF){p+=46+nlen+elen+clen;continue;}  /* ZIP64は対象外 */
+    var lnlen=dv.getUint16(lho+26,true),lelen=dv.getUint16(lho+28,true);
+    var start=lho+30+lnlen+lelen;
+    out.push({name:name,method:method,start:start,size:csize});
+    p+=46+nlen+elen+clen;
+  }
+  return out;
+}
+function inflateRaw(u8){
+  if(typeof DecompressionStream!=="function")return Promise.resolve(null);
+  try{
+    var ds=new DecompressionStream("deflate-raw");
+    var stream=new Blob([u8]).stream().pipeThrough(ds);
+    return new Response(stream).arrayBuffer();
+  }catch(e){return Promise.resolve(null);}
+}
+function mimeOf(name){
+  var m=/\.([a-z0-9]+)$/i.exec(name||"");
+  var e=m?m[1].toLowerCase():"";
+  if(e==="png")return "image/png";
+  if(e==="webp")return "image/webp";
+  if(e==="gif")return "image/gif";
+  return "image/jpeg";
+}
+
+/* ---------- 取り込み ---------- */
+var running=false,cancel=false;
+function put(key,blob,name){
+  return Promise.resolve(K.images.put(key,blob,{name:name}));
+}
+function importBuffer(buf,ui){
+  var entries=readEntries(buf);
+  if(!entries)return Promise.resolve({ok:0,skip:0,fail:0,error:"ZIPとして読めませんでした"});
+  var whole=new Blob([buf]);          /* 分割のたびにコピーしないよう、参照で切り出す */
+  var ok=0,skip=0,fail=0,i=0;
+  function step(){
+    if(cancel)return Promise.resolve({ok:ok,skip:skip,fail:fail,cancelled:true});
+    if(i>=entries.length)return Promise.resolve({ok:ok,skip:skip,fail:fail});
+    var e=entries[i++];
+    var base=e.name.split("/").pop();
+    if(!/\.(png|jpe?g|webp|gif)$/i.test(base)){return next();}
+    var keys=stemMap[cleanStem(base)];
+    if(!keys||!keys.length){return next();}
+    var part=whole.slice(e.start,e.start+e.size,mimeOf(base));
+    var work=(e.method===0)?Promise.resolve(part):inflateRaw(part);
+    return work.then(function(b){
+      if(!b){fail++;return next();}
+      var blob=(e.method===0)?part:new Blob([b],{type:mimeOf(base)});
+      return Promise.all(keys.map(function(k){
+        if(K.images.has&&K.images.has(k)){skip++;return null;}
+        return put(k,blob,base).then(function(){ok++;}).catch(function(){fail++;});
+      })).then(next);
+    }).catch(function(){fail++;return next();});
+  }
+  function next(){
+    if(i%8===0&&ui)ui.tick(ok,skip,fail,i,entries.length);
+    if(i%8===0)return new Promise(function(r){setTimeout(r,0);}).then(step);
+    return step();
+  }
+  return step();
+}
+function download(url,onProg){
+  return fetch(url,{cache:"no-store"}).then(function(r){
+    if(!r||!r.ok)return null;
+    var total=parseInt(r.headers.get("content-length")||"0",10)||0;
+    if(!r.body||!r.body.getReader){
+      return r.arrayBuffer().then(function(b){if(onProg)onProg(b.byteLength,b.byteLength||b.byteLength);return b;});
+    }
+    var reader=r.body.getReader();
+    var buf=total?new Uint8Array(total):null,chunks=[],got=0;
+    function pump(){
+      return reader.read().then(function(res){
+        if(res.done)return;
+        var c=res.value;
+        if(buf){ if(got+c.length>buf.length){var nb=new Uint8Array(got+c.length);nb.set(buf.subarray(0,got));buf=nb;} buf.set(c,got); }
+        else chunks.push(c);
+        got+=c.length;
+        if(onProg)onProg(got,total);
+        return pump();
+      });
+    }
+    return pump().then(function(){
+      if(buf){
+        if(buf.length===got)return buf.buffer;
+        var out=new Uint8Array(got);out.set(buf.subarray(0,got));return out.buffer;
+      }
+      var o=new Uint8Array(got),at=0;
+      chunks.forEach(function(c){o.set(c,at);at+=c.length;});
+      return o.buffer;
+    });
+  }).catch(function(){return null;});
+}
+function runImport(parts,file,ui){
+  if(running)return Promise.resolve();
+  running=true;cancel=false;
+  var totals={ok:0,skip:0,fail:0,missing:0};
+  function one(index){
+    if(cancel)return Promise.resolve();
+    if(file&&index===0){
+      return file.arrayBuffer().then(function(b){return importBuffer(b,ui);}).then(acc).then(function(){return one(-1);});
+    }
+    if(index<0)return Promise.resolve();
+    if(index>=MAX_PARTS)return Promise.resolve();
+    var url=PACK_BASE+(index===0?"":"-"+(index+1))+".zip";
+    ui.msg("画像パッケージを確認しています…",url);
+    return download(url,function(g,t){ui.prog(t?g/t:(index?1:0.3));}).then(function(b){
+      if(!b){
+        if(index===0)totals.missing=1;
+        return Promise.resolve();          /* 無ければそこで終わり */
+      }
+      ui.msg("取り込んでいます…",url);
+      return importBuffer(b,ui).then(function(r){
+        return acc(r);
+      }).then(function(){return one(index+1);});
+    }).catch(function(){totals.missing=1;});
+  }
+  function acc(r){
+    if(r){totals.ok+=r.ok||0;totals.skip+=r.skip||0;totals.fail+=r.fail||0;
+      if(r.error)ui.msg(r.error,"");}
+    return Promise.resolve();
+  }
+  return one(file?0:0).then(function(){
+    running=false;
+    try{if(K.data&&K.data.refresh)K.data.refresh();}catch(e){}
+    try{if(K.rerender)K.rerender();}catch(e){}
+    if(!totals.missing&&totals.ok+totals.skip>=B.manifest.length*0.5){
+      try{localStorage.setItem(FLAG,ver);}catch(e){}
+      droppedDismissLimit();
+    }
+    return totals;
+  });
+}
+
+/* ---------- 画面 ---------- */
+var bar=null;
+function buildBar(){
+  if(bar||!document.body)return bar;
+  bar=document.createElement("div");
+  bar.id="kaPackBar";
+  bar.style.cssText="position:fixed;left:12px;right:12px;bottom:calc(80px + env(safe-area-inset-bottom,0px));z-index:65;display:flex;gap:10px;align-items:center;background:#fffef9;border:1px solid #dcd7c2;border-radius:14px;padding:10px 12px;box-shadow:0 10px 26px rgba(30,40,25,.18);font-family:'Noto Sans JP',system-ui,sans-serif";
+  bar.innerHTML=
+    '<div style="flex:1;min-width:0">'+
+      '<div id="kaPackMsg" style="font-size:13px;font-weight:700;color:#1b241a;line-height:1.5">画像をまとめて取り込めます</div>'+
+      '<div id="kaPackSub" style="font-size:11.5px;color:#6c7666;line-height:1.5">初回のみ・以後は全ページ即表示</div>'+
+      '<div style="height:5px;background:#eceada;border-radius:999px;margin-top:6px;overflow:hidden"><i id="kaPackPg" style="display:block;height:100%;width:0;background:#b0862a;transition:width .25s"></i></div>'+
+    '</div>'+
+    '<button id="kaPackGo" type="button" style="flex:0 0 auto;border:1px solid #2f6238;background:#2f6238;color:#fff;border-radius:999px;padding:9px 16px;font-size:13px;font-weight:700;font-family:inherit;cursor:pointer">取り込む</button>'+
+    '<button id="kaPackNo" type="button" style="flex:0 0 auto;border:0;background:transparent;color:#6c7666;font-size:12px;font-family:inherit;cursor:pointer;padding:6px 2px">あとで</button>';
+  document.body.appendChild(bar);
+  bar.querySelector("#kaPackNo").onclick=function(){hide();try{sessionStorage.setItem(SEEN,"1");}catch(e){}addDismiss();};
+  bar.querySelector("#kaPackGo").onclick=function(){
+    var go=bar.querySelector("#kaPackGo");
+    go.disabled=true;go.style.opacity=".5";go.textContent="取込中…";
+    runImport(null,null,{
+      msg:function(t){var m=bar.querySelector("#kaPackMsg");if(m)m.textContent=t;},
+      prog:function(p){var q=bar.querySelector("#kaPackPg");if(q)q.style.width=Math.round(Math.max(0,Math.min(1,p))*100)+"%";},
+      tick:function(ok,skip,fail,i,total){
+        var m=bar.querySelector("#kaPackMsg");
+        if(m)m.textContent="取り込んでいます… "+(ok+skip)+" / "+total;
+        var s=bar.querySelector("#kaPackSub");
+        if(s)s.textContent="入れた "+ok+" 枚"+(skip?"（済み "+skip+"）":"")+(fail?" / 読めず "+fail:"");
+      }
+    }).then(function(t){
+      bar.querySelector("#kaPackMsg").textContent="取り込みが終わりました（"+t.ok+" 枚）";
+      bar.querySelector("#kaPackSub").textContent="以後はどのページもすぐ表示されます";
+      bar.querySelector("#kaPackPg").style.width="100%";
+      go.textContent="閉じる";go.disabled=false;go.style.opacity="1";
+      go.onclick=function(){hide();};
+      setTimeout(hide,6000);
+    });
+  };
+  return bar;
+}
+function hide(){ if(bar&&bar.parentNode){try{bar.parentNode.removeChild(bar);}catch(e){}} bar=null; }
+function show(sizeText,sizeBytes){
+  buildBar();
+  var s=bar.querySelector("#kaPackSub");
+  if(s)s.textContent=sizeText?("初回のみ・"+sizeText+" ／ 以後は全ページ即表示"):"初回のみ・以後は全ページ即表示";
+}
+/* 手元のZIPを選んで取り込む（公開前に試すとき用） */
+function importFile(){
+  var inp=document.createElement("input");
+  inp.type="file";inp.accept=".zip,application/zip";
+  inp.onchange=function(){
+    var f=inp.files&&inp.files[0];
+    if(!f)return;
+    show((f.size/1048576).toFixed(1)+" MB");
+    var go=bar.querySelector("#kaPackGo");
+    go.disabled=true;go.textContent="取込中…";
+    runImport(null,f,{
+      msg:function(t){bar.querySelector("#kaPackMsg").textContent=t;},
+      prog:function(p){bar.querySelector("#kaPackPg").style.width=Math.round(p*100)+"%";},
+      tick:function(ok,skip,fail,i,total){bar.querySelector("#kaPackMsg").textContent="取り込んでいます… "+(ok+skip)+" / "+total;}
+    }).then(function(t){
+      bar.querySelector("#kaPackMsg").textContent="取り込みが終わりました（"+t.ok+" 枚）";
+      go.textContent="閉じる";go.onclick=function(){hide();};
+      setTimeout(hide,5000);
+    });
+  };
+  inp.click();
+}
+
+/* ---------- 起動時の確認（1バージョンにつき1回だけ） ---------- */
+function alreadyImported(){
+  try{return localStorage.getItem(FLAG)===ver;}catch(e){return false;}
+}
+function seenThisSession(){
+  try{return sessionStorage.getItem(SEEN)==="1";}catch(e){return false;}
+}
+/* 「あとで」を押した回数（同じ版で2回押されたら、もう出さない） */
+function dismissCount(){
+  try{
+    var o=JSON.parse(localStorage.getItem(DISMISS)||"null");
+    if(!o||o.v!==ver)return 0;
+    return o.n||0;
+  }catch(e){return 0;}
+}
+function addDismiss(){
+  try{localStorage.setItem(DISMISS,JSON.stringify({v:ver,n:dismissCount()+1}));}catch(e){}
+}
+function droppedDismissLimit(){
+  try{localStorage.removeItem(DISMISS);}catch(e){}
+}
+function checkAndOffer(){
+  if(alreadyImported())return;
+  if(seenThisSession())return;
+  if(dismissCount()>=2)return;             /* 2回ことわられたら、この版では出さない */
+  var checked=false;
+  try{checked=localStorage.getItem(CHECK)===ver;}catch(e){}
+  if(checked)return;                       /* 前回「無い」と確認済み */
+  fetch(PACK_BASE+".zip",{method:"HEAD",cache:"no-store"}).then(function(r){
+    try{localStorage.setItem(CHECK,ver);}catch(e){}
+    if(!r||!r.ok)return;
+    var len=parseInt(r.headers.get("content-length")||"0",10)||0;
+    show(len?(len/1048576).toFixed(1)+" MB":"",len);
+  }).catch(function(){});
+}
+
+window.KA=window.KA||{};
+window.KA.packImport={
+  importFile:importFile,
+  importUrl:function(){ return runImport(null,null,{msg:function(){},prog:function(){},tick:function(){}}); },
+  status:function(){
+    var imported=false;try{imported=localStorage.getItem(FLAG)===ver;}catch(e){}
+    return {version:ver,imported:imported,packUrl:PACK_BASE+".zip"};
+  },
+  forget:function(){try{localStorage.removeItem(FLAG);localStorage.removeItem(CHECK);}catch(e){}}
+};
+
+/* アプリの起動を邪魔しないよう、描画が落ち着いてから確認する */
+setTimeout(checkAndOffer,2500);
+})();
+</script>
 <style id="kaStudyBar">
 /* 学習アクション（覚えた／後で復習／学習完了）を、読書の邪魔にならない控えめな1行に */
 .sticky-actions{ bottom: calc(var(--nav-h) + 6px + env(safe-area-inset-bottom, 0px)); }
@@ -30715,6 +31039,18 @@ probe(function(){start();});
 
 </script>
 <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4bc70e2c01a94c73b74392e4234840661791215815920" integrity="sha512-L0ha0OXavK/8okipN9F8BtP84dg9DUhPERbBXzwI6dgTA55d2+yweo3pn5CSFYs45/r8md2+xvUPtTdvTNRfjA==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","spa":2}' crossorigin="anonymous"></script>
+
+<script id="kaServiceWorker">(function(){
+  /* PWA: ホーム画面に追加で使えるようにし、画像を端末に残す。
+     Service Worker は https（または localhost）でのみ動きます。
+     file:// で直接開いたときは登録されません（その場合もアプリは通常どおり動きます）。 */
+  if(!("serviceWorker" in navigator))return;
+  var ok = (location.protocol==="https:"||location.hostname==="localhost"||location.hostname==="127.0.0.1");
+  if(!ok)return;
+  window.addEventListener("load",function(){
+    try{navigator.serviceWorker.register("sw.js").catch(function(){});}catch(e){}
+  });
+})();</script>
 <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4bc70e2c01a94c73b74392e4234840661791215815920" integrity="sha512-L0ha0OXavK/8okipN9F8BtP84dg9DUhPERbBXzwI6dgTA55d2+yweo3pn5CSFYs45/r8md2+xvUPtTdvTNRfjA==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","spa":2}' crossorigin="anonymous"></script>
 </body>
 </html>
