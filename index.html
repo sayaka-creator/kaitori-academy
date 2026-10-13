@@ -29692,6 +29692,8 @@ if(!B||!B.manifest||!B.manifest.length)return;
 
 var STORE_FLAG="ka_dist_images_loaded";
 var PROBE_KEY="ka_img_probe_v1";
+var REV_KEY="ka_img_rev";      /* 公開側の更新番号を覚えておく */
+var INDEX_KEY="ka_img_index_v1";  /* 実際のファイル名の一覧（1回の確認で1発解決） */
 var ver="d5|"+B.v;
 var list=B.manifest,byKey={},n;
 for(n=0;n<list.length;n++)byKey[list[n].k]=list[n];
@@ -29714,6 +29716,8 @@ try{
 }catch(e){}
 
 var pickDir=DIRS[0],pickExt=".webp",probed=false;
+var revMap={},revAt={},revPending={},revChecked=false,revBudget=MOBILE?25:60;
+var idxMap=null;
 var DONE={},MISS={},queued={},urgent=[],busy=0,bgIndex=0,tokens=CAP,
     storeReady=false,timerOn=false,finished=false,bgFrom=Date.now()+BG_START,
     lastInput=Date.now(),lastGrant=0,badgeEl=null,badgeTimer=null,
@@ -29736,7 +29740,25 @@ function keyStems(k){
   return [p[1]||""];
 }
 function extOfUrl(u){var m=/\.([a-z0-9]+)(?:\?|#|$)/i.exec(String(u||""));return m?"."+m[1].toLowerCase():null;}
-function urlsFor(f,k){
+function indexLoad(){
+  try{
+    var o=JSON.parse(localStorage.getItem(INDEX_KEY)||"null");
+    if(o&&o.files)idxMap=o;
+  }catch(e){idxMap=null;}
+}
+function indexFetch(cb){
+  fetch("images-index.json",{cache:"no-cache"}).then(function(r){
+    if(!r||!r.ok)return null;
+    return r.json();
+  }).then(function(o){
+    if(o&&o.files){
+      idxMap=o;
+      try{localStorage.setItem(INDEX_KEY,JSON.stringify(o));}catch(e){}
+    }
+    if(cb)cb();
+  }).catch(function(){if(cb)cb();});
+}
+function urlsFor(f,k,bust){
   var out=[],add=function(x){if(x&&out.indexOf(x)<0)out.push(x);};
   var m=/^(.*)\.([A-Za-z0-9]+)$/i.exec(String(f||""));
   var stems=[m?m[1]:String(f||"")];
@@ -29744,7 +29766,17 @@ function urlsFor(f,k){
   var oext=m?"."+m[2].toLowerCase():null,exts=[];
   [pickExt,oext,".webp",".png",".jpg",".jpeg",".gif"].forEach(function(x){if(x&&exts.indexOf(x)<0)exts.push(x);});
   var dirs=[pickDir].concat(DIRS).filter(function(d,i,a){return d&&a.indexOf(d)===i;});
+  /* 実際のファイル名の一覧があれば、それを最優先（1回のアクセスで見つかる） */
+  if(idxMap&&idxMap.files){
+    var idir=idxMap.dir||"assets/images/";
+    stems.forEach(function(st){
+      var nm=idxMap.files[st.toLowerCase()];
+      if(nm)add(idir+nm);
+    });
+  }
   dirs.forEach(function(d){stems.forEach(function(st){exts.forEach(function(x){add(d+st+x);});});});
+  /* 更新時は ?u= を付けて、端末に残っている古い画像を使わせない */
+  if(bust)out=out.map(function(x){return x+"?u="+encodeURIComponent(bust);});
   return out;
 }
 function guessType(u){
@@ -29761,14 +29793,18 @@ function tryFetch(l,n){
     return r.blob().then(function(b){return {blob:b,url:l[n]};});
   }).catch(function(){return tryFetch(l,n+1);});
 }
-function loadOne(en){
+function loadOne(en,bust){
   busy++;
-  return tryFetch(urlsFor(en.f,en.k),0).then(function(r){
+  return tryFetch(urlsFor(en.f,en.k,bust),0).then(function(r){
     if(!r){MISS[en.k]=Date.now();return null;}
     var blob=r.blob;
     if(!blob||!blob.type)blob=new Blob([blob],{type:guessType(r.url)});
     return Promise.resolve(K.images.put(en.k,blob,{name:en.f})).then(function(){
-      DONE[en.k]=1;delete MISS[en.k];return en;
+      DONE[en.k]=1;delete MISS[en.k];
+      revAt[en.k]=Date.now();
+      if(revPending[en.k]){revMap[en.k]=revPending[en.k];delete revPending[en.k];revSave();}
+      else revSave();
+      return en;
     });
   }).catch(function(){MISS[en.k]=Date.now();return null;})
    .then(function(r){busy--;return r;});
@@ -29866,7 +29902,7 @@ function tick(){
       if(!routeHit(head.k))tokens--;
       nextQueued();
       showBadge();
-      loadOne(head).then(function(r){if(r)scheduleRedraw();});
+      loadOne(head,revPending[head.k]?ver:null).then(function(r){if(r)scheduleRedraw();});
       setTimeout(tick,GAP);return;
     }
   }
@@ -29930,6 +29966,71 @@ function probe(cb){
   })(0);
 }
 
+/* ------------------------------------------------------------------
+   公開側の更新を取り込む
+   ・images-rev.json（＝どの画像が今の版か）を1回だけ取りに行く
+   ・端末の画像と番号が違うものだけ、その画像だけ取り直す
+   ・端末側で後から編集された画像は上書きしない
+   ------------------------------------------------------------------ */
+function revLoad(){
+  try{
+    var o=JSON.parse(localStorage.getItem(REV_KEY)||"null");
+    if(o&&o.map){revMap=o.map;revAt=o.at||{};}
+  }catch(e){revMap={};revAt={};}
+}
+function revSave(){
+  try{localStorage.setItem(REV_KEY,JSON.stringify({map:revMap,at:revAt}));}catch(e){}
+}
+function revStem(n){
+  return String(n||"").replace(/\s*\(\d+\)\s*$/,"").toLowerCase();
+}
+function revTargets(o,onlyKeys){
+  var byStem={},n;
+  for(n in o.files)byStem[revStem(n)]=String(o.files[n]);
+  var upd=[],i;
+  for(i=0;i<list.length;i++){
+    var en=list[i];
+    if(onlyKeys&&!storeHas(en.k))continue;
+    var m=/^(.*)\.([A-Za-z0-9]+)$/.exec(en.f);
+    var want=byStem[revStem(m?m[1]:en.f)];
+    if(!want)continue;
+    if(revMap[en.k]===want)continue;
+    var edited=false;
+    try{
+      var inf=K.images.info&&K.images.info(en.k);
+      if(inf&&inf.updatedAt&&revAt[en.k]&&inf.updatedAt>revAt[en.k]+1500)edited=true;
+    }catch(e){}
+    if(edited){revPending[en.k]=want;continue;}
+    upd.push({k:en.k,want:want});
+  }
+  return upd;
+}
+function revSync(){
+  if(revChecked)return;
+  revChecked=true;
+  fetch("images-rev.json",{cache:"no-store"}).then(function(r){
+    if(!r||!r.ok)return null;
+    return r.json();
+  }).then(function(o){
+    if(!o||!o.files)return;
+    var upd=revTargets(o,false),done=0,i;
+    for(i=0;i<upd.length&&done<revBudget;i++){
+      var u=upd[i];
+      revPending[u.k]=u.want;
+      if(storeHas(u.k)){
+        try{K.images.del(u.k);}catch(e){}
+        need(u.k);
+      }
+      done++;
+    }
+    if(done){
+      showBadge();start();
+      console.log("[更新] 画像を "+done+" 枚、新しい版に差し替えます");
+    }
+    if(done<upd.length)console.log("[更新] 残り "+(upd.length-done)+" 枚は次に開いたときに取り込みます");
+  }).catch(function(){});
+}
+
 /* --- 画像ストアが使えるようになってから動かす --- */
 try{
   Promise.resolve(K.images.ready()).then(function(){storeReady=true;},function(){storeReady=true;});
@@ -29950,16 +30051,34 @@ if(typeof origUrlFor==="function"){
 window.KA.distImages={
   manifest:list,
   demand:need,
+  /* パッケージ取り込み直後に呼ぶ：全画像を「今の版」として記録する */
+  refreshIndex:function(){return indexFetch(function(){});},
+  revAfterImport:function(){
+    revChecked=true;
+    return fetch("images-rev.json",{cache:"no-store"}).then(function(r){
+      return r&&r.ok?r.json():null;
+    }).then(function(o){
+      if(!o||!o.files)return 0;
+      var upd=revTargets(o,true),i;
+      for(i=0;i<upd.length;i++){revMap[upd[i].k]=upd[i].want;revAt[upd[i].k]=Date.now();}
+      revSave();
+      return upd.length;
+    }).catch(function(){return 0;});
+  },
   loadAll:function(){tokens=999999;PREFETCH=true;bgFrom=0;start();},
   status:function(){
     var miss=0,k;for(k in MISS)miss++;
     return {dir:pickDir,ext:pickExt,total:list.length,loaded:Object.keys(DONE).length,
-            waiting:urgent.length,busy:busy,tokens:tokens,prefetch:PREFETCH,missing:miss};
+            waiting:urgent.length,busy:busy,tokens:tokens,prefetch:PREFETCH,missing:miss,
+            updPending:Object.keys(revPending).length,revKnown:Object.keys(revMap).length,
+            index:idxMap?(Object.keys(idxMap.files||{}).length+" 件"):"なし"};
   },
   missing:function(){var out=[],k;for(k in MISS){var en=byKey[k];out.push(en?en.f:k);}return out;}
 };
 
-probe(function(){start();});
+indexLoad();
+revLoad();
+probe(function(){indexFetch(function(){revSync();start();});});
 })();
 </script>
 <script id="kaPackImport">
@@ -30155,6 +30274,9 @@ function runImport(parts,file,ui){
     if(!totals.missing&&totals.ok+totals.skip>=B.manifest.length*0.5){
       try{localStorage.setItem(FLAG,ver);}catch(e){}
       droppedDismissLimit();
+      try{
+        if(K.distImages&&K.distImages.revAfterImport)K.distImages.revAfterImport();
+      }catch(e){}
     }
     return totals;
   });
