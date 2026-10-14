@@ -21677,6 +21677,7 @@ window.KA_DATA_NEWS = [
 
 </script>
 
+<script id="kaFoundationData">
 /* ==================== 追加 2026-10-14：査定の土台知識（カテゴリー5・教材48） ==================== */
 window.KA_DATA_CATEGORIES = (window.KA_DATA_CATEGORIES || []).concat([
 /* ================== 新大カテゴリー：査定の土台知識（5中カテゴリー） ================== */
@@ -23162,6 +23163,7 @@ window.KA_DATA_LESSONS = (window.KA_DATA_LESSONS || []).concat([
   isPublished: true, needsReview: false, dailyTrivia: false
 }
 ]);
+</script>
 <script data-src="js/data.js">
 /* ==========================================================================
    買取アカデミー — 教材データの合成（標準データ ＋ 管理画面での編集内容）
@@ -32906,37 +32908,33 @@ K.adminPublish={
 <script id="kaQuizAnswerFix">
 (function(){
   'use strict';
-  var FIX = [{id:'q-era-02',answer:0},{id:'q-img-k18',answer:1},{id:'q-feature-01',answer:2},{id:'qtv-08',answer:0},{id:'qtv-09',answer:0},{id:'qtv-14',answer:0}];
-  function norm(t){
-    return String(t==null?'':t).normalize('NFKC')
-      .replace(/[\s\u3000]+/g,'')
-      .replace(/[「」『』【】\[\]（）()、。,.・:：;；]/g,'').toLowerCase();
-  }
-  function needs(cs,a,fx){
-    if(!cs||!cs.length) return true;
-    if(typeof a!=='number'||a<0||a>=cs.length) return true;
-    if(cs.some(function(c){return /【要編集】|（未入力）/.test(String(c));})) return true;
-    return norm(cs[a])!==norm(fx);
+  /* 端末に残っている古い正解番号を、解説どおりに戻すための最小レイヤー
+     ・対象の問題だけ「選択肢」と「正解番号」を正しい内容にそろえます
+     ・既に正しい端末では何もしません
+     ・学習履歴（kaitori_academy_state_v1 など）には触れません */
+  var FIX = [{"id": "q-era-02", "choices": ["御木本幸吉", "シャネル", "ルイ・ヴィトン", "ティファニー"], "answer": 0}, {"id": "q-img-k18", "choices": ["100%", "75%", "58.5%", "41.7%"], "answer": 1}, {"id": "q-feature-01", "choices": ["K24", "Pt900", "GP", "Silver925"], "answer": 2}, {"id": "qtv-08", "choices": ["戦車の形", "開発者の名前", "都市の名前", "王室の紋章"], "answer": 0}, {"id": "qtv-09", "choices": ["中国", "南アフリカ", "オーストラリア", "アメリカ"], "answer": 0}, {"id": "qtv-14", "choices": ["75%", "58.5%", "99.9%", "62.5%"], "answer": 0}];
+  function same(a,b){
+    if(!Array.isArray(a)||!Array.isArray(b)||a.length!==b.length) return false;
+    for(var i=0;i<a.length;i++){ if(String(a[i])!==String(b[i])) return false; }
+    return true;
   }
   function run(){
-    var D=window.KA&&window.KA.data; if(!D||!D.question) return 0;
+    var D=window.KA&&window.KA.data; if(!D||!D.question||!D.patchQuestion) return 0;
     var n=0;
     FIX.forEach(function(f){
-      var q=D.question(f.id); if(!q||!q.choices) return;
-      var cs=q.choices.filter(function(c){return !/【要編集】|（未入力）/.test(String(c));});
-      if(needs(cs,q.answer,f.answer)) return;
-      var i=cs.map(norm).indexOf(norm(f.answer));
-      if(i<0) i=(typeof q.answer==='number'&&q.answer<cs.length)?q.answer:0;
-      if(i!==q.answer || cs.length!==q.choices.length){
-        try{ if(D.patchQuestion){ D.patchQuestion(f.id,{choices:cs,answer:i}); n++; } }catch(e){}
-      }
+      var q=D.question(f.id); if(!q) return;
+      if(same(q.choices,f.choices)&&q.answer===f.answer) return;
+      try{ D.patchQuestion(f.id,{choices:f.choices.slice(),answer:f.answer}); n++; }catch(e){}
     });
-    if(n){ try{D.refresh&&D.refresh();}catch(e){} try{window.KA.rerender&&window.KA.rerender();}catch(e){} }
+    if(n){
+      try{D.refresh&&D.refresh();}catch(e){}
+      try{window.KA.rerender&&window.KA.rerender();}catch(e){}
+    }
     return n;
   }
-  function boot(){ try{ if(run()) console.log('[修正] クイズの正解を '+run()+' 件そろえました'); }catch(e){} }
-  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){setTimeout(boot,1200);});
-  else setTimeout(boot,1200);
+  function boot(){ try{ var n=run(); if(n) console.log('[修正] クイズの正解を '+n+' 件そろえました'); }catch(e){} }
+  if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',function(){setTimeout(boot,1500);});
+  else setTimeout(boot,1500);
   window.KA=window.KA||{}; window.KA.quizAnswerFix={run:run,list:FIX};
 })();
 </script>
