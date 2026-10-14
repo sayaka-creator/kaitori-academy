@@ -5,7 +5,7 @@
    ・インストール時に何百枚もまとめて取得するようなことはしない
    更新したときは CACHE の数字を1つ上げてください（例 kaitori-v1 → kaitori-v2）
    ========================================================================== */
-var CACHE = "kaitori-v1";
+var CACHE = "kaitori-v2";
 
 self.addEventListener("install", function (e) {
   self.skipWaiting();
@@ -60,6 +60,19 @@ self.addEventListener("fetch", function (e) {
     || /\/icons\//.test(h)
     || /\/assets\/dist\//.test(h);
   if (!imageLike) return;
+
+  /* 更新（?u=付き）は必ず新しいものを取りに行く */
+  if (url.searchParams && url.searchParams.has("u")) {
+    e.respondWith(
+      fetch(req).then(function (res) {
+        putSafe(req, res);
+        return res;
+      }).catch(function () {
+        return caches.match(req);
+      })
+    );
+    return;
+  }
 
   e.respondWith(
     caches.match(req).then(function (m) {
